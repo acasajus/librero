@@ -1,0 +1,28 @@
+[package]
+name = "librero"
+version = "0.1.0"
+edition = "2021"
+description = "Rust library and CLI client for Z-Library over Tor (.onion)"
+
+[dependencies]
+tokio = { version = "1.40", features = ["full"] }
+reqwest = { version = "0.12", features = ["json", "socks", "cookies", "stream"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive", "env"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+futures-util = "0.3"
+toml = "0.8"
+dirs = "5.0"
+arti-client = { version = "0.23", features = ["tokio", "onion-service-client"], optional = true }
+tor-rtcompat = { version = "0.23", features = ["tokio"], optional = true }
+teloxide = { version = "0.13", features = ["macros"] }
+lettre = { version = "0.11", features = ["tokio1-native-tls", "smtp-transport", "builder"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+[features]
+default = ["embedded-tor"]
+embedded-tor = ["dep:arti-client", "dep:tor-rtcompat"]
