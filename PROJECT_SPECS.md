@@ -1,58 +1,77 @@
-# Librero Architectural Specifications & Design Decisions
+# Librero - Project Specifications & Memory
 
-## 1. Executive Overview
-
-`librero` is an automated **Telegram Bot Daemon Service** written in Rust. It authenticates to **Z-Library hidden services on the Tor network (.onion)** via reverse-engineered **eAPI** REST endpoints, listens for orders from authorized Telegram users, saves books to local storage and a **Turso/SQLite database**, and delivers books as attachments via **Gmail SMTP**.
-
-Primary gateway: `http://loginzlib2vrak5zzpcocc3ouizykn6k5qecgj2tzlnab5wcbqhembyd.onion`  
-Fallback mirror: `http://bookszlibb74ugqojhzhg2a63w5i2atv5bqarulgczawnbmsb6s6qead.onion`
+## Overview
+**Librero** is a Rust service daemon that bridges Telegram with Z-Library hidden services on the Tor network. It allows authorized users to search for books, view full metadata, download files directly to their Telegram client or send them as attachments via SMTP (Brevo, Gmail App Password, or custom SMTP), and manage their download history.
 
 ---
 
-## 2. System Architecture
+## 🏗️ Architecture & Component Design
 
 ```
-librero/
-├── Cargo.toml                  # Dependencies & crate metadata
-├── config.example.toml         # Up-to-date TOML configuration example template
-├── .gitignore                  # Excludes config.toml, databases, and downloads
-├── README.md                   # Quick start & Telegram command guide
-├── PROJECT_SPECS.md            # Technical specifications & design decisions
-└── src/
-    ├── lib.rs                  # Crate root & module re-exports
-    ├── main.rs                 # Service daemon entry point
-    ├── bot.rs                  # Telegram Bot listener, commands & inline button callbacks
-    ├── client.rs               # ZLibraryClient eAPI async driver & mirror fallbacks
-    ├── config.rs               # TOML Configuration schema & reader
-    ├── db.rs                   # Turso / SQLite database manager
-    ├── email.rs                # Gmail SMTP email attachment sender
-    ├── models.rs               # Serde JSON data structures & schemas
-    └── tor.rs                  # Tor network transport & SOCKS5/Arti embedded modes
+                       +-------------------------------+
+                       |   Telegram App (User Chat)    |
+                       +---------------+---------------+
+                                       |
+                                       v
+                       +---------------+---------------+
+                       |     Librero Rust Daemon       |
+                       |          (teloxide)           |
+                       +-------+-------+-------+-------+
+                               |       |       |
+             +-----------------+       |       +-----------------+
+             v                         v                         v
++------------+------------+  +---------+---------+  +------------+------------+
+|  Embedded Arti Tor      |  | Turso / SQLite DB |  | SMTP Email Sender          |
+|  (arti-client)          |  |  (librero.db)     |  | (lettre - Port 587)       |
++------------+------------+  +-------------------+  +-------------------------+
+             |
+             v
++------------+------------+
+| Z-Library Onion Mirrors |
+| (eAPI over Tor stream)  |
++-------------------------+
 ```
-
-> [!IMPORTANT]
-> **Configuration File Policy**:
-> 1. Always update `config.example.toml` whenever configuration schemas or defaults change.
-> 2. **NEVER read or inspect `config.toml`** to protect secret credentials (passwords, bot tokens, app passwords).
 
 ---
 
-## 3. Detailed Specifications
+## 🔑 Core Features & Specifications
 
-### 3.1 Access Control & Telegram User Filtering
-- Every message and inline callback query is checked against `config.telegram.allowed_users`.
-- Unauthorized Telegram user IDs are blocked.
+### 1. Tor Connection & Failover Strategy (`src/tor.rs`, `src/client.rs`)
+- **Connection Mode**: Pure Rust embedded **Arti Tor** (`arti-client`) connecting directly to public Tor nodes (`mode = "embedded"` by default). No local system `tor` service required.
+- **Primary Onion Mirror**: `http://loginzlib2vrak5zzpcocc3ouizykn6k5qecgj2tzlnab5wcbqhembyd.onion`
+- **Fallback Mirror**: `http://bookszlibb74ugqojhzhg2a63w5i2atv5bqarulgczawnbmsb6s6qead.onion`
+- **Automatic Retry Policy**: Retries up to 3 times per mirror with a 1.5-second backoff delay on Tor/network errors (`timeout`, `connection reset`, `circuit error`, HTTP `502`/`503`/`504`). Automatically fails over to secondary `.onion` mirrors.
 
-### 3.2 `doctor` Diagnostic Command
-- Verifies Tor hidden service connectivity to Z-Library.
-- Queries Z-Library account profile and daily download limits (`downloadsToday` / `downloadsLimit`).
-- Verifies SMTP server connectivity.
-- Verifies Turso / SQLite database health and total recorded downloads.
+### 2. Startup Sequence & Parallel Diagnostics (`src/main.rs`, `src/bot.rs`)
+- **Immediate Startup**: Telegram Bot starts listening immediately upon service launch. Z-Library auto-login runs concurrently in a background task.
+- **Parallel `/doctor` Command**: Executes all 3 health checks (Tor & Z-Library profile, SMTP server connection, Turso DB check) **concurrently in parallel** using `tokio::join!`.
 
-### 3.3 Book Download Pipeline
-When an inline download button (`dl_<book_id>_<hash>`) is clicked by an authorized user:
-1. **Tor Download**: Fetches download URL over Tor via Z-Library eAPI and streams the binary file.
-2. **Local Storage**: Saves the file in `./downloads/<TELEGRAM_USER_ID>/<filename>`.
-3. **Database Logging**: Inserts a record into the `downloads` table in the Turso/SQLite database.
-4. **Gmail SMTP Delivery**: Emails the book file attachment to the user's configured recipient email address.
-5. **Telegram Feedback**: Edits the Telegram message with download confirmation, local path, and email status.
+### 3. Telegram Bot Commands & Interactive UX (`src/bot.rs`)
+- **Command Menu Registration**: Automatically registers commands (`/start`, `/search`, `/doctor`, `/history`, `/help`) with Telegram UI.
+- **Access Control**: Restricts bot access strictly to Telegram `user_id`s configured in `config.toml`.
+- **Formatting**: HTML mode (`ParseMode::Html`) with HTML escaping.
+- **Top 10 Full Book Cards**: Always displays up to 10 search results as full cards with complete untruncated titles, authors, publishers, years, languages, formats, and file sizes.
+- **Dual Delivery Buttons**:
+  - `[ 📧 Send Email (EPUB) ]`: Downloads file, saves locally to `./downloads/<user_id>/`, records in DB, and sends via SMTP.
+  - `[ 💬 Send to Telegram ]`: Downloads file and uploads document directly into the Telegram chat (`bot.send_document`).
+
+### 4. Database & Download History (`src/db.rs`, `src/bot.rs`)
+- **Turso / SQLite DB (`librero.db`)**: Stores full metadata for every download (`telegram_user_id`, `user_email`, `book_id`, `book_title`, `book_author`, `extension`, `filesize`, `local_path`, `sent_via_email`, `downloaded_at`).
+- **`/history` Command**: Lists recent downloads with real titles and authors, plus interactive re-send buttons:
+  - `[ 📧 Re-send Email ]`: Re-delivers from local disk cache via SMTP.
+  - `[ 💬 Send to Telegram ]`: Uploads document directly from local disk cache into Telegram chat.
+
+### 5. SMTP Email Delivery (`src/email.rs`)
+- Supports **Brevo**, **Gmail (with App Password)**, Outlook, or custom SMTP servers on port `587` (STARTTLS).
+- Detailed error logging and Telegram status updates on delivery failure.
+
+### 6. Development & Task Runner (`justfile`, `Makefile`, `watch.sh`)
+- `just watch` / `make watch` / `./watch.sh`: Automatically watches source file changes and restarts `cargo run --mode embedded`.
+
+---
+
+## 🔒 Configuration & Privacy Rules
+
+- **Format**: `config.toml` (TOML format).
+- **Security Rule**: `config.toml` is ignored in `.gitignore`.
+- **Policy**: **ALWAYS** update `config.example.toml`. **NEVER** read or modify `config.toml`.

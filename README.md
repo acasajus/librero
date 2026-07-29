@@ -65,6 +65,21 @@ cargo run
 
 ---
 
+## ⚡ Live Reload & Automatic Restarts
+
+To automatically recompile and restart the daemon whenever source files change:
+
+```bash
+# Option A: Run via just
+just watch
+
+# Option B: Run via Makefile
+make watch
+
+# Option C: Run via watch script directly
+./watch.sh
+```
+
 ## 🤖 Telegram Bot Commands
 
 | Command / Action | Description |
