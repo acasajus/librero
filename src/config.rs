@@ -184,12 +184,12 @@ username = "myuser"             # Optional reference username
 email = "mykindle@kindle.com"   # Email address where books will be sent
 
 [smtp]
-# Gmail SMTP Configuration
+# SMTP Server Configuration (Brevo, Gmail App Password, or custom SMTP server)
 host = "smtp.gmail.com"
 port = 587
-username = "your_gmail@gmail.com"
-password = "your_gmail_app_password"  # Gmail App Password (not your main password)
-from_email = "your_gmail@gmail.com"
+username = "your_smtp_username@example.com"
+password = "your_smtp_password"
+from_email = "your_sender_email@example.com"
 
 [storage]
 # Local directory to store downloaded books (subdirectories created per user)

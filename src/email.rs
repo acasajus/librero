@@ -5,7 +5,7 @@ use lettre::transport::smtp::authentication::Credentials;
 use lettre::{Message, SmtpTransport, Transport};
 use tracing::{error, info, warn};
 
-/// Email Sender Service using Gmail SMTP
+/// Email Sender Service using SMTP (Gmail, Brevo, custom SMTP)
 #[derive(Clone, Debug)]
 pub struct EmailSender {
     config: SmtpSettings,
@@ -16,7 +16,7 @@ impl EmailSender {
         Self { config }
     }
 
-    /// Build an SmtpTransport client using Gmail SMTP settings (STARTTLS on port 587)
+    /// Build an SmtpTransport client using SMTP settings (STARTTLS on port 587)
     fn build_transport(&self) -> Result<SmtpTransport> {
         let creds = Credentials::new(self.config.username.clone(), self.config.password.clone());
 
@@ -45,11 +45,11 @@ impl EmailSender {
             }
             Ok(false) => {
                 warn!("SMTP test connection returned false");
-                Ok(())
+                Err(anyhow!("SMTP server test connection failed"))
             }
             Err(e) => {
-                info!("SMTP connection check info: {}", e);
-                Ok(())
+                error!("SMTP connection/authentication test error: {}", e);
+                Err(anyhow!("SMTP authentication failed: {}", e))
             }
         }
     }

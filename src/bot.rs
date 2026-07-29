@@ -32,7 +32,7 @@ pub async fn start_bot(state: AppState) -> Result<()> {
     let commands = vec![
         BotCommand::new("start", "Start the bot and view usage instructions"),
         BotCommand::new("search", "Search books on Z-Library (e.g. /search rust)"),
-        BotCommand::new("doctor", "Check Tor, Z-Library quota, Gmail SMTP & DB health"),
+        BotCommand::new("doctor", "Check Tor, Z-Library quota, SMTP & DB health"),
         BotCommand::new("history", "View your recent download history & re-send books"),
         BotCommand::new("help", "Display help and command menu"),
     ];
@@ -141,22 +141,42 @@ async fn handle_message(bot: Bot, msg: Message, state: AppState) -> ResponseResu
     }
 }
 
-/// Perform health check diagnostics (`/doctor` command)
+/// Perform health check diagnostics (`/doctor` command) in parallel
 async fn handle_doctor_cmd(bot: &Bot, msg: &Message, state: &AppState) -> ResponseResult<()> {
     let user_obj = msg.from.as_ref().unwrap();
-    info!("Running /doctor health check diagnostics for Telegram user {}", user_obj.id);
+    info!("Running /doctor health check diagnostics in parallel for Telegram user {}", user_obj.id);
 
     let status_msg = bot.send_message(msg.chat.id, "🩺 <b>Running System Diagnostics...</b>")
         .parse_mode(ParseMode::Html)
         .send()
         .await?;
 
-    let client = state.client.lock().await;
+    let state_tor = state.clone();
+    let state_email = state.clone();
+    let state_db = state.clone();
 
-    // 1. Z-Library & Tor Connection Status
-    let profile_res = client.get_profile().await;
-    let (tor_ok, profile_info) = match profile_res {
-        Ok(prof) => (
+    // Task 1: Check Tor & Z-Library profile concurrently over Tor
+    let check_tor = tokio::spawn(async move {
+        let client = state_tor.client.lock().await;
+        client.get_profile().await
+    });
+
+    // Task 2: Check SMTP Server connection concurrently
+    let check_smtp = tokio::task::spawn_blocking(move || {
+        state_email.email.check_connection()
+    });
+
+    // Task 3: Check Turso/SQLite Database health concurrently
+    let check_db = tokio::task::spawn_blocking(move || {
+        state_db.db.get_total_downloads()
+    });
+
+    // Execute all 3 checks concurrently in parallel
+    let (tor_res, smtp_res, db_res) = tokio::join!(check_tor, check_smtp, check_db);
+
+    // Format Tor & Z-Library status
+    let (tor_ok, profile_info) = match tor_res {
+        Ok(Ok(prof)) => (
             "✅ Connected",
             format!(
                 "Account: <b>{}</b>\nDownloads Today: <b>{} / {}</b>",
@@ -165,19 +185,22 @@ async fn handle_doctor_cmd(bot: &Bot, msg: &Message, state: &AppState) -> Respon
                 prof.downloads_limit.unwrap_or(0)
             ),
         ),
-        Err(e) => ("❌ Error", format!("Connection failed: {}", html_escape(&e.to_string()))),
+        Ok(Err(e)) => ("❌ Error", format!("Connection failed: {}", html_escape(&e.to_string()))),
+        Err(e) => ("❌ Task Error", format!("Tor check failed: {}", e)),
     };
 
-    // 2. SMTP Health
-    let smtp_status = match state.email.check_connection() {
-        Ok(_) => "✅ Connected",
-        Err(_) => "❌ Disconnected / Invalid Credentials",
+    // Format SMTP Server status
+    let smtp_status = match smtp_res {
+        Ok(Ok(_)) => "✅ Connected".to_string(),
+        Ok(Err(e)) => format!("❌ Disconnected ({})", html_escape(&e.to_string())),
+        Err(e) => format!("❌ Task Error: {}", e),
     };
 
-    // 3. Database Health
-    let db_status = match state.db.get_total_downloads() {
-        Ok(cnt) => format!("✅ Healthy ({} records logged)", cnt),
-        Err(e) => format!("❌ Database Error: {}", e),
+    // Format Database status
+    let db_status = match db_res {
+        Ok(Ok(cnt)) => format!("✅ Healthy ({} records logged)", cnt),
+        Ok(Err(e)) => format!("❌ Database Error: {}", e),
+        Err(e) => format!("❌ Task Error: {}", e),
     };
 
     let user_id = user_obj.id.0 as i64;
@@ -186,7 +209,7 @@ async fn handle_doctor_cmd(bot: &Bot, msg: &Message, state: &AppState) -> Respon
     let report = format!(
         "🏥 <b>Librero Doctor Health Report</b>\n\n\
         🌐 <b>Tor & Z-Library Connection:</b> {}\n{}\n\n\
-        📧 <b>Gmail SMTP Server:</b> {}\n\
+        📧 <b>SMTP Server:</b> {}\n\
         📫 <b>Your Target Email:</b> <code>{}</code>\n\n\
         🗄️ <b>Turso/SQLite Database:</b> {}\n\n\
         🚀 <b>Status:</b> System operational and listening for orders.",
