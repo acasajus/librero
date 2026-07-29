@@ -70,5 +70,6 @@ cargo run
 | Command | Action |
 | :--- | :--- |
 | **`doctor`** or **`/doctor`** | Checks system health (Tor connection, Z-Library quota, Gmail SMTP, Turso DB) |
-| **`rust programming`** or **`/search <query>`** | Searches Z-Library and returns interactive messages with `📥 Download` buttons |
-| **`[📥 Download]` Button Click** | Downloads book over Tor, saves to `./downloads/<user_id>/`, records entry in Turso DB, and emails the file attachment via SMTP |
+| **`history`** or **`/history`** | Displays your recent download history from the Turso/SQLite database |
+| **`/search <query>`** | Searches Z-Library over Tor: <br>• **If none found**: Displays "No books found".<br>• **If ≤ 10 books**: Displays detailed info cards for each book with `📥 Download` buttons.<br>• **If > 10 books**: Displays alert and a simple clickable list; clicking any book opens its card & download button. |
+| **`[📥 Download]` Button** | Downloads book over Tor, saves to `./downloads/<user_id>/`, logs record in Turso DB, and sends file attachment via Gmail SMTP |

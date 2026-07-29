@@ -2,12 +2,12 @@ use crate::client::ZLibraryClient;
 use crate::config::Config;
 use crate::db::Database;
 use crate::email::EmailSender;
-use crate::models::SearchQuery;
+use crate::models::{Book, SearchQuery};
 use anyhow::Result;
 use std::path::PathBuf;
 use std::sync::Arc;
 use teloxide::prelude::*;
-use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup, ParseMode};
+use teloxide::types::{BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, ParseMode};
 use tokio::fs;
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
@@ -28,6 +28,21 @@ pub async fn start_bot(state: AppState) -> Result<()> {
 
     let bot = Bot::new(token);
 
+    // Register Telegram Bot Command Menu in Telegram UI
+    let commands = vec![
+        BotCommand::new("start", "Start the bot and view usage instructions"),
+        BotCommand::new("search", "Search books on Z-Library (e.g. /search rust)"),
+        BotCommand::new("doctor", "Check Tor, Z-Library quota, Gmail SMTP & DB health"),
+        BotCommand::new("history", "View your recent download history"),
+        BotCommand::new("help", "Display help and command menu"),
+    ];
+
+    if let Err(e) = bot.set_my_commands(commands).send().await {
+        warn!("Failed to register Telegram bot command menu: {}", e);
+    } else {
+        info!("Registered command menu with Telegram: /start, /search, /doctor, /history, /help");
+    }
+
     let handler = dptree::entry()
         .branch(Update::filter_message().endpoint(handle_message))
         .branch(Update::filter_callback_query().endpoint(handle_callback));
@@ -42,7 +57,7 @@ pub async fn start_bot(state: AppState) -> Result<()> {
     Ok(())
 }
 
-/// Handle incoming Telegram messages (`doctor`, `/doctor`, search queries)
+/// Handle incoming Telegram messages (`/start`, `/doctor`, `/history`, `/search`, plain queries)
 async fn handle_message(bot: Bot, msg: Message, state: AppState) -> ResponseResult<()> {
     let user = match msg.from {
         Some(ref u) => u,
@@ -65,57 +80,92 @@ async fn handle_message(bot: Bot, msg: Message, state: AppState) -> ResponseResu
         None => return Ok(()),
     };
 
-    if text.eq_ignore_ascii_case("doctor") || text.eq_ignore_ascii_case("/doctor") {
-        handle_doctor_cmd(&bot, &msg, &state).await?;
-        return Ok(());
+    let first_word = text.split_whitespace().next().unwrap_or("").to_lowercase();
+    let base_cmd = first_word.split('@').next().unwrap_or("");
+
+    match base_cmd {
+        "/start" | "/help" => {
+            let welcome_text = format!(
+                "📚 <b>Welcome to Librero Bot!</b>\n\n\
+                Available Commands:\n\
+                • <code>/search &lt;query&gt;</code> - Search for books on Z-Library\n\
+                • <code>/doctor</code> - Run system health diagnostics\n\
+                • <code>/history</code> - View your download history\n\
+                • <code>/help</code> - Show this menu\n\n\
+                <i>You can also send any book title/author directly to search!</i>"
+            );
+            bot.send_message(msg.chat.id, welcome_text)
+                .parse_mode(ParseMode::Html)
+                .send()
+                .await?;
+            Ok(())
+        }
+        "/doctor" | "doctor" => {
+            handle_doctor_cmd(&bot, &msg, &state).await?;
+            Ok(())
+        }
+        "/history" | "history" => {
+            handle_history_cmd(&bot, &msg, &state).await?;
+            Ok(())
+        }
+        "/search" => {
+            let query_str = text.trim_start_matches("/search").trim();
+            let query_str = query_str.split('@').next().unwrap_or(query_str).trim();
+            if query_str.is_empty() {
+                bot.send_message(
+                    msg.chat.id,
+                    "💡 <b>Usage:</b> Send <code>/search &lt;title/author&gt;</code> (e.g. <code>/search rust programming</code>).",
+                )
+                .parse_mode(ParseMode::Html)
+                .send()
+                .await?;
+                return Ok(());
+            }
+            handle_search_cmd(&bot, &msg, &state, query_str).await?;
+            Ok(())
+        }
+        _ => {
+            if text.starts_with('/') {
+                bot.send_message(
+                    msg.chat.id,
+                    format!("❌ Unknown command <code>{}</code>. Use <code>/help</code> or <code>/doctor</code>.", html_escape(base_cmd)),
+                )
+                .parse_mode(ParseMode::Html)
+                .send()
+                .await?;
+                return Ok(());
+            }
+            handle_search_cmd(&bot, &msg, &state, text).await?;
+            Ok(())
+        }
     }
-
-    // Process as a search query
-    let query_str = if text.starts_with("/search") {
-        text.trim_start_matches("/search").trim()
-    } else {
-        text
-    };
-
-    if query_str.is_empty() {
-        bot.send_message(
-            msg.chat.id,
-            "💡 *Usage:* Send any book title/author to search, or type `doctor` to check system health.",
-        )
-        .parse_mode(ParseMode::MarkdownV2)
-        .send()
-        .await?;
-        return Ok(());
-    }
-
-    handle_search_cmd(&bot, &msg, &state, query_str).await?;
-    Ok(())
 }
 
-/// Perform health check diagnostics (`doctor` command)
+/// Perform health check diagnostics (`/doctor` command)
 async fn handle_doctor_cmd(bot: &Bot, msg: &Message, state: &AppState) -> ResponseResult<()> {
     let user_obj = msg.from.as_ref().unwrap();
-    info!("Running doctor health check diagnostics for Telegram user {}", user_obj.id);
-    let status_msg = bot.send_message(msg.chat.id, "🩺 *Running System Diagnostics...*")
-        .parse_mode(ParseMode::MarkdownV2)
+    info!("Running /doctor health check diagnostics for Telegram user {}", user_obj.id);
+
+    let status_msg = bot.send_message(msg.chat.id, "🩺 <b>Running System Diagnostics...</b>")
+        .parse_mode(ParseMode::Html)
         .send()
         .await?;
 
     let client = state.client.lock().await;
 
-    // 1. Z-Library & Tor Status
+    // 1. Z-Library & Tor Connection Status
     let profile_res = client.get_profile().await;
     let (tor_ok, profile_info) = match profile_res {
         Ok(prof) => (
             "✅ Connected",
             format!(
-                "Account: {}\nDownloads Today: {} / {}",
-                prof.name.unwrap_or_else(|| "Active".into()),
+                "Account: <b>{}</b>\nDownloads Today: <b>{} / {}</b>",
+                html_escape(prof.name.as_deref().unwrap_or("Active")),
                 prof.downloads_today.unwrap_or(0),
                 prof.downloads_limit.unwrap_or(0)
             ),
         ),
-        Err(e) => ("❌ Error", format!("Connection failed: {}", e)),
+        Err(e) => ("❌ Error", format!("Connection failed: {}", html_escape(&e.to_string()))),
     };
 
     // 2. SMTP Health
@@ -134,33 +184,134 @@ async fn handle_doctor_cmd(bot: &Bot, msg: &Message, state: &AppState) -> Respon
     let target_email = state.config.find_user_email(user_id).unwrap_or_else(|| "Not configured".into());
 
     let report = format!(
-        "🏥 *Librero Doctor Health Report*\n\n\
-        🌐 *Tor & Z-Library Connection:* {}\n{}\n\n\
-        📧 *Gmail SMTP Server:* {}\n\
-        📫 *Your Target Email:* `{}`\n\n\
-        🗄️ *Turso/SQLite Database:* {}\n\n\
-        🚀 *Status:* System operational and listening for orders.",
+        "🏥 <b>Librero Doctor Health Report</b>\n\n\
+        🌐 <b>Tor & Z-Library Connection:</b> {}\n{}\n\n\
+        📧 <b>Gmail SMTP Server:</b> {}\n\
+        📫 <b>Your Target Email:</b> <code>{}</code>\n\n\
+        🗄️ <b>Turso/SQLite Database:</b> {}\n\n\
+        🚀 <b>Status:</b> System operational and listening for orders.",
         tor_ok, profile_info, smtp_status, target_email, db_status
     );
 
     bot.edit_message_text(msg.chat.id, status_msg.id, report)
-        .parse_mode(ParseMode::MarkdownV2)
+        .parse_mode(ParseMode::Html)
         .send()
         .await?;
 
     Ok(())
 }
 
-/// Execute book search and render results with inline download buttons
+/// View download history (`/history` command)
+async fn handle_history_cmd(bot: &Bot, msg: &Message, state: &AppState) -> ResponseResult<()> {
+    let user_obj = msg.from.as_ref().unwrap();
+    let user_id = user_obj.id.0 as i64;
+
+    info!("Retrieving download history for Telegram user {}", user_id);
+
+    match state.db.get_user_history(user_id, 10) {
+        Ok(records) => {
+            if records.is_empty() {
+                bot.send_message(msg.chat.id, "📜 <b>No download history found for your account.</b>")
+                    .parse_mode(ParseMode::Html)
+                    .send()
+                    .await?;
+                return Ok(());
+            }
+
+            let mut text = format!("📜 <b>Your Recent Download History (Latest {}):</b>\n\n", records.len());
+
+            for (idx, r) in records.iter().enumerate() {
+                let ext = r.extension.as_deref().unwrap_or("N/A").to_uppercase();
+                let author = r.book_author.as_deref().unwrap_or("Unknown Author");
+                let size_str = if let Some(bytes) = r.filesize {
+                    format!("{:.2} MB", bytes as f64 / 1_048_576.0)
+                } else {
+                    "N/A".to_string()
+                };
+
+                let email_icon = if r.sent_via_email { "📧 Sent" } else { "⚠️ Email Failed" };
+
+                text.push_str(&format!(
+                    "{}. 📖 <b>{}</b>\n   👤 Author: {}\n   📅 Date: <code>{}</code>\n   📁 {} ({}) | {}\n   💾 Path: <code>{}</code>\n\n",
+                    idx + 1,
+                    html_escape(&r.book_title),
+                    html_escape(author),
+                    r.downloaded_at,
+                    ext,
+                    size_str,
+                    email_icon,
+                    html_escape(&r.local_path)
+                ));
+            }
+
+            bot.send_message(msg.chat.id, text)
+                .parse_mode(ParseMode::Html)
+                .send()
+                .await?;
+        }
+        Err(err) => {
+            error!("Failed to fetch user history: {}", err);
+            bot.send_message(msg.chat.id, format!("❌ Failed to retrieve history: {}", html_escape(&err.to_string())))
+                .parse_mode(ParseMode::Html)
+                .send()
+                .await?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Format a rich information card for a single book with full title & complete metadata
+fn send_book_card(index: usize, book: &Book) -> (String, InlineKeyboardMarkup) {
+    let ext = book.extension.as_deref().unwrap_or("N/A").to_uppercase();
+    let size = book.filesize_string.as_deref().unwrap_or("N/A");
+    let author = book.author.as_deref().unwrap_or("Unknown Author");
+    let year = book.year.as_deref().unwrap_or("N/A");
+    let publisher = book.publisher.as_deref().unwrap_or("N/A");
+    let lang = book.language.as_deref().unwrap_or("N/A");
+    let hash = book.hash.as_deref().unwrap_or("nohash");
+
+    let card_text = format!(
+        "{}. 📖 <b>{}</b>\n\n\
+        👤 <b>Author:</b> {}\n\
+        🏢 <b>Publisher:</b> {}\n\
+        📅 <b>Year:</b> {} | 🌐 <b>Lang:</b> {}\n\
+        📁 <b>Format:</b> {} ({})",
+        index,
+        html_escape(&book.title),
+        html_escape(author),
+        html_escape(publisher),
+        html_escape(year),
+        html_escape(lang),
+        ext,
+        size
+    );
+
+    let callback_data = format!("dl_{}_{}", book.id, hash);
+    let button_label = format!("📥 Download {} ({})", ext, size);
+
+    let keyboard = InlineKeyboardMarkup::new(vec![vec![
+        InlineKeyboardButton::callback(button_label, callback_data),
+    ]]);
+
+    (card_text, keyboard)
+}
+
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
+/// Execute book search and display up to 10 books always with full information cards
 async fn handle_search_cmd(bot: &Bot, msg: &Message, state: &AppState, query: &str) -> ResponseResult<()> {
-    let searching_msg = bot.send_message(msg.chat.id, format!("🔍 Searching Z-Library over Tor for `{}`...", query))
+    let searching_msg = bot.send_message(msg.chat.id, format!("🔍 Searching Z-Library over Tor for <code>{}</code>...", html_escape(query)))
+        .parse_mode(ParseMode::Html)
         .send()
         .await?;
 
     let req = SearchQuery {
         query: query.to_string(),
         page: 1,
-        limit: 5,
+        limit: 20,
         ..Default::default()
     };
 
@@ -168,7 +319,8 @@ async fn handle_search_cmd(bot: &Bot, msg: &Message, state: &AppState, query: &s
     match client.search(&req).await {
         Ok(books) => {
             if books.is_empty() {
-                bot.edit_message_text(msg.chat.id, searching_msg.id, format!("❌ No books found for `{}`.", query))
+                bot.edit_message_text(msg.chat.id, searching_msg.id, format!("❌ No books found for <code>{}</code>.", html_escape(query)))
+                    .parse_mode(ParseMode::Html)
                     .send()
                     .await?;
                 return Ok(());
@@ -176,33 +328,24 @@ async fn handle_search_cmd(bot: &Bot, msg: &Message, state: &AppState, query: &s
 
             bot.delete_message(msg.chat.id, searching_msg.id).send().await.ok();
 
-            bot.send_message(msg.chat.id, format!("📚 *Found {} books for '{}':*", books.len(), query))
-                .parse_mode(ParseMode::MarkdownV2)
+            let display_count = books.len().min(10);
+            let top_books = &books[..display_count];
+
+            let header = if books.len() > 10 {
+                format!("📚 <b>Found more than 10 books for '{}'</b> (showing top 10 with full details):", html_escape(query))
+            } else {
+                format!("📚 <b>Found {} books for '{}':</b>", books.len(), html_escape(query))
+            };
+
+            bot.send_message(msg.chat.id, header)
+                .parse_mode(ParseMode::Html)
                 .send()
                 .await?;
 
-            for book in books {
-                let ext = book.extension.as_deref().unwrap_or("N/A").to_uppercase();
-                let size = book.filesize_string.as_deref().unwrap_or("N/A");
-                let author = book.author.as_deref().unwrap_or("Unknown Author");
-                let year = book.year.as_deref().unwrap_or("N/A");
-                let hash = book.hash.as_deref().unwrap_or("nohash");
-
-                let text = format!(
-                    "📖 *{}*\n👤 Author: {}\n📅 Year: {} | 📁 Format: {} ({})",
-                    book.title, author, year, ext, size
-                );
-
-                // Callback data payload: dl_<book_id>_<hash>
-                let callback_data = format!("dl_{}_{}", book.id, hash);
-                let button_label = format!("📥 Download {}", ext);
-
-                let keyboard = InlineKeyboardMarkup::new(vec![vec![
-                    InlineKeyboardButton::callback(button_label, callback_data),
-                ]]);
-
-                bot.send_message(msg.chat.id, text)
-                    .parse_mode(ParseMode::MarkdownV2)
+            for (idx, book) in top_books.iter().enumerate() {
+                let (card_text, keyboard) = send_book_card(idx + 1, book);
+                bot.send_message(msg.chat.id, card_text)
+                    .parse_mode(ParseMode::Html)
                     .reply_markup(keyboard)
                     .send()
                     .await?;
@@ -210,7 +353,8 @@ async fn handle_search_cmd(bot: &Bot, msg: &Message, state: &AppState, query: &s
         }
         Err(err) => {
             error!("Search error: {}", err);
-            bot.edit_message_text(msg.chat.id, searching_msg.id, format!("❌ Search failed: {}", err))
+            bot.edit_message_text(msg.chat.id, searching_msg.id, format!("❌ Search failed: {}", html_escape(&err.to_string())))
+                .parse_mode(ParseMode::Html)
                 .send()
                 .await?;
         }
@@ -237,6 +381,11 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, state: AppState) -> Respons
         None => return Ok(()),
     };
 
+    let chat_id = match q.message {
+        Some(ref m) => m.chat().id,
+        None => return Ok(()),
+    };
+
     if !data.starts_with("dl_") {
         return Ok(());
     }
@@ -257,41 +406,43 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, state: AppState) -> Respons
     };
     let book_hash = parts[1];
 
-    let chat_id = match q.message {
-        Some(ref m) => m.chat().id,
-        None => return Ok(()),
-    };
-
     let status_msg = bot.send_message(chat_id, format!("📥 Fetching download link for book ID {} over Tor...", book_id))
+        .parse_mode(ParseMode::Html)
         .send()
         .await?;
 
     // 1. Resolve download URL & fetch bytes over Tor
-    let (dl_url, book_bytes, _book_info) = {
+    let (dl_url, book_bytes) = {
         let client = state.client.lock().await;
         let url = match client.get_download_url(book_id, book_hash).await {
             Ok(u) => u,
             Err(e) => {
-                bot.edit_message_text(chat_id, status_msg.id, format!("❌ Failed to get download URL: {}", e))
+                bot.edit_message_text(chat_id, status_msg.id, format!("❌ Failed to get download URL: {}", html_escape(&e.to_string())))
+                    .parse_mode(ParseMode::Html)
                     .send()
                     .await?;
                 return Ok(());
             }
         };
 
-        bot.edit_message_text(chat_id, status_msg.id, "⏬ Downloading book binary file over Tor...").send().await.ok();
+        bot.edit_message_text(chat_id, status_msg.id, "⏬ Downloading book binary file over Tor...")
+            .parse_mode(ParseMode::Html)
+            .send()
+            .await
+            .ok();
 
         let bytes = match client.download_book_bytes(&url).await {
             Ok(b) => b,
             Err(e) => {
-                bot.edit_message_text(chat_id, status_msg.id, format!("❌ Download failed: {}", e))
+                bot.edit_message_text(chat_id, status_msg.id, format!("❌ Download failed: {}", html_escape(&e.to_string())))
+                    .parse_mode(ParseMode::Html)
                     .send()
                     .await?;
                 return Ok(());
             }
         };
 
-        (url, bytes, book_id)
+        (url, bytes)
     };
 
     let ext = if dl_url.contains(".epub") { "epub" } else if dl_url.contains(".pdf") { "pdf" } else { "bin" };
@@ -316,8 +467,8 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, state: AppState) -> Respons
     // 3. Send email attachment via Gmail SMTP to configured user email
     let recipient_email = state.config.find_user_email(user_id).unwrap_or_default();
     let email_sent = if !recipient_email.is_empty() {
-        bot.edit_message_text(chat_id, status_msg.id, format!("📧 Sending book via SMTP to `{}`...", recipient_email))
-            .parse_mode(ParseMode::MarkdownV2)
+        bot.edit_message_text(chat_id, status_msg.id, format!("📧 Sending book via SMTP to <code>{}</code>...", html_escape(&recipient_email)))
+            .parse_mode(ParseMode::Html)
             .send()
             .await
             .ok();
@@ -340,7 +491,7 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, state: AppState) -> Respons
     };
 
     // 4. Record entry in Turso DB
-    let dummy_book = crate::models::Book {
+    let dummy_book = Book {
         id: book_id,
         title: format!("Book {}", book_id),
         author: None,
@@ -362,21 +513,21 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, state: AppState) -> Respons
 
     // 5. Send final confirmation report to Telegram user
     let email_status_str = if email_sent {
-        format!("Sent to `{}`", recipient_email)
+        format!("Sent to <code>{}</code>", html_escape(&recipient_email))
     } else {
         "Failed / Not configured".to_string()
     };
 
     let confirmation_text = format!(
-        "✅ *Download Complete\\!*\n\n\
-        📁 *Saved Locally:* `{}`\n\
-        📧 *Email:* {}\n\
-        📦 *Size:* {} bytes",
-        local_path_str, email_status_str, book_bytes.len()
+        "✅ <b>Download Complete!</b>\n\n\
+        📁 <b>Saved Locally:</b> <code>{}</code>\n\
+        📧 <b>Email:</b> {}\n\
+        📦 <b>Size:</b> {} bytes",
+        html_escape(&local_path_str), email_status_str, book_bytes.len()
     );
 
     bot.edit_message_text(chat_id, status_msg.id, confirmation_text)
-        .parse_mode(ParseMode::MarkdownV2)
+        .parse_mode(ParseMode::Html)
         .send()
         .await?;
 

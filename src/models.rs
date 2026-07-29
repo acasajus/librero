@@ -68,6 +68,93 @@ pub struct Book {
     pub download_url: Option<String>,
 }
 
+impl Book {
+    /// Resilient JSON parser for Z-Library book objects (handles string/int type variations)
+    pub fn from_json_value(val: &serde_json::Value) -> Option<Self> {
+        let obj = val.as_object()?;
+
+        // Parse ID: string or number
+        let id = obj.get("id").and_then(|v| {
+            if let Some(n) = v.as_u64() {
+                Some(n)
+            } else if let Some(s) = v.as_str() {
+                s.parse::<u64>().ok()
+            } else {
+                None
+            }
+        })?;
+
+        // Parse Title: string or printable number
+        let title = obj.get("title").and_then(|v| {
+            if let Some(s) = v.as_str() {
+                Some(s.to_string())
+            } else if v.is_number() {
+                Some(v.to_string())
+            } else {
+                None
+            }
+        }).unwrap_or_else(|| format!("Book {}", id));
+
+        let author = obj.get("author").and_then(|v| v.as_str().map(|s| s.to_string()));
+        let publisher = obj.get("publisher").and_then(|v| v.as_str().map(|s| s.to_string()));
+
+        // Parse Year: string or integer
+        let year = obj.get("year").and_then(|v| {
+            if let Some(s) = v.as_str() {
+                Some(s.to_string())
+            } else if let Some(n) = v.as_i64() {
+                Some(n.to_string())
+            } else {
+                None
+            }
+        });
+
+        let language = obj.get("language").and_then(|v| v.as_str().map(|s| s.to_string()));
+        let extension = obj.get("extension").and_then(|v| v.as_str().map(|s| s.to_string()));
+
+        // Parse Filesize: u64 or string
+        let filesize = obj.get("filesize").and_then(|v| {
+            if let Some(n) = v.as_u64() {
+                Some(n)
+            } else if let Some(s) = v.as_str() {
+                s.parse::<u64>().ok()
+            } else {
+                None
+            }
+        });
+
+        let filesize_string = obj.get("filesize_string")
+            .or_else(|| obj.get("filesizeReport"))
+            .and_then(|v| v.as_str().map(|s| s.to_string()));
+
+        let cover = obj.get("cover").and_then(|v| v.as_str().map(|s| s.to_string()));
+        let hash = obj.get("hash").and_then(|v| v.as_str().map(|s| s.to_string()));
+        let description = obj.get("description").and_then(|v| v.as_str().map(|s| s.to_string()));
+
+        let download_url = obj.get("dlUrl")
+            .or_else(|| obj.get("url"))
+            .and_then(|v| v.as_str().map(|s| s.to_string()));
+
+        Some(Book {
+            id,
+            title,
+            author,
+            publisher,
+            year,
+            language,
+            extension,
+            filesize,
+            filesize_string,
+            cover,
+            hash,
+            description,
+            rating: None,
+            quality: None,
+            download_url,
+        })
+    }
+}
+
 /// Search request parameters.
 #[derive(Debug, Clone, Default)]
 pub struct SearchQuery {
@@ -121,22 +208,22 @@ mod tests {
     }
 
     #[test]
-    fn test_book_deserialization() {
-        let json_data = r#"{
-            "id": 98765,
+    fn test_resilient_book_parser() {
+        let json_val: serde_json::Value = serde_json::from_str(r#"{
+            "id": "98765",
             "title": "Rust Programming in Action",
             "author": "Jane Doe",
-            "publisher": "Tech Press",
-            "year": "2024",
+            "year": 2024,
             "extension": "epub",
-            "filesize": 1048576,
-            "filesize_string": "1.0 MB",
+            "filesize": "1048576",
             "hash": "a1b2c3d4e5f6"
-        }"#;
+        }"#).unwrap();
 
-        let book: Book = serde_json::from_str(json_data).unwrap();
+        let book = Book::from_json_value(&json_val).unwrap();
         assert_eq!(book.id, 98765);
         assert_eq!(book.title, "Rust Programming in Action");
+        assert_eq!(book.year.as_deref(), Some("2024"));
+        assert_eq!(book.filesize, Some(1048576));
         assert_eq!(book.extension.as_deref(), Some("epub"));
         assert_eq!(book.hash.as_deref(), Some("a1b2c3d4e5f6"));
     }

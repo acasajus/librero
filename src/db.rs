@@ -89,6 +89,40 @@ impl Database {
         Ok(id)
     }
 
+    /// Query recent download history for a specific Telegram user ID
+    pub fn get_user_history(&self, telegram_user_id: i64, limit: usize) -> Result<Vec<DownloadRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, telegram_user_id, user_email, book_id, book_title, book_author, extension, filesize, local_path, sent_via_email, downloaded_at
+             FROM downloads
+             WHERE telegram_user_id = ?1
+             ORDER BY id DESC
+             LIMIT ?2",
+        )?;
+
+        let history_iter = stmt.query_map(params![telegram_user_id, limit as i64], |row| {
+            Ok(DownloadRecord {
+                id: row.get(0)?,
+                telegram_user_id: row.get(1)?,
+                user_email: row.get(2)?,
+                book_id: row.get(3)?,
+                book_title: row.get(4)?,
+                book_author: row.get(5)?,
+                extension: row.get(6)?,
+                filesize: row.get(7)?,
+                local_path: row.get(8)?,
+                sent_via_email: row.get(9)?,
+                downloaded_at: row.get(10)?,
+            })
+        })?;
+
+        let mut records = Vec::new();
+        for record in history_iter {
+            records.push(record?);
+        }
+        Ok(records)
+    }
+
     /// Query total download count for health check
     pub fn get_total_downloads(&self) -> Result<u64> {
         let conn = self.conn.lock().unwrap();
