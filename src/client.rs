@@ -369,9 +369,11 @@ impl ZLibraryClient {
                         let text = res.text().await?;
                         let json_val: serde_json::Value = serde_json::from_str(&text)?;
 
-                        let dl_url = json_val.get("file").and_then(|f| f.get("url")).and_then(|u| u.as_str())
+                        let dl_url = json_val.get("file").and_then(|f| f.get("downloadLink").or_else(|| f.get("url")).or_else(|| f.get("dlUrl"))).and_then(|u| u.as_str())
+                            .or_else(|| json_val.get("response").and_then(|r| r.get("file")).and_then(|f| f.get("downloadLink").or_else(|| f.get("url"))).and_then(|u| u.as_str()))
+                            .or_else(|| json_val.get("response").and_then(|r| r.get("url").or_else(|| r.get("downloadLink"))).and_then(|u| u.as_str()))
+                            .or_else(|| json_val.get("downloadLink").and_then(|u| u.as_str()))
                             .or_else(|| json_val.get("url").and_then(|u| u.as_str()))
-                            .or_else(|| json_val.get("response").and_then(|r| r.get("url")).and_then(|u| u.as_str()))
                             .ok_or_else(|| anyhow!("Download URL not found in response: {}", text))?;
 
                         info!("Resolved download URL for book {}: {}", book_id, dl_url);
@@ -399,26 +401,57 @@ impl ZLibraryClient {
     /// Download book binary bytes from the given URL over Tor with retries across onion candidates
     pub async fn download_book_bytes(&self, download_url: &str) -> Result<Vec<u8>> {
         info!("Downloading book binary file over Tor stream for URL: {}", download_url);
-        let mut last_err = anyhow!("Download failed on all onion mirrors");
 
-        let relative_path = if download_url.starts_with("http://") || download_url.starts_with("https://") {
-            if let Ok(parsed) = reqwest::Url::parse(download_url) {
-                let mut p = parsed.path().to_string();
-                if let Some(q) = parsed.query() {
-                    p.push('?');
-                    p.push_str(q);
+        // If download_url is an absolute HTTP/HTTPS URL (e.g. https://dln1.ncdn.ec/books-files/...), download directly over Tor proxy
+        if download_url.starts_with("http://") || download_url.starts_with("https://") {
+            let mut last_err = anyhow!("Download failed from {}", download_url);
+            for attempt in 1..=MAX_RETRIES_PER_MIRROR {
+                info!("[Attempt {}/{}] Downloading book file directly from: {}", attempt, MAX_RETRIES_PER_MIRROR, download_url);
+
+                let req = self.client.get(download_url);
+                let req = self.apply_session_headers(req);
+
+                match req.send().await {
+                    Ok(res) => {
+                        let status = res.status();
+                        debug!("Book download HTTP status: {} from {}", status, download_url);
+
+                        if !status.is_success() {
+                            last_err = anyhow!("Failed downloading book from {}, HTTP status: {}", download_url, status);
+                            if status.is_server_error() && attempt < MAX_RETRIES_PER_MIRROR {
+                                warn!("HTTP {} downloading book. Retrying attempt {}/{}...", status, attempt + 1, MAX_RETRIES_PER_MIRROR);
+                                sleep(Duration::from_millis(RETRY_BACKOFF_MS)).await;
+                                continue;
+                            }
+                            return Err(last_err);
+                        }
+
+                        let bytes = res.bytes().await.context("Failed to read book file stream")?;
+                        info!("Download complete: received {} bytes", bytes.len());
+                        return Ok(bytes.to_vec());
+                    }
+                    Err(e) => {
+                        let err_msg = e.to_string();
+                        last_err = anyhow!("Failed downloading book stream from {}: {}", download_url, err_msg);
+
+                        if Self::is_retryable_onion_error(&err_msg) && attempt < MAX_RETRIES_PER_MIRROR {
+                            warn!("Network/Tor error downloading book (Attempt {}/{}): {}. Retrying in {}ms...", attempt, MAX_RETRIES_PER_MIRROR, err_msg, RETRY_BACKOFF_MS);
+                            sleep(Duration::from_millis(RETRY_BACKOFF_MS)).await;
+                        } else {
+                            warn!("{}", last_err);
+                            break;
+                        }
+                    }
                 }
-                p
-            } else {
-                download_url.to_string()
             }
-        } else {
-            download_url.to_string()
-        };
+            return Err(last_err);
+        }
 
+        // Relative path -> attempt download across onion mirror candidates
+        let mut last_err = anyhow!("Download failed on all onion mirrors");
         let candidates = self.config.onion_candidates();
         for (idx, base_url) in candidates.iter().enumerate() {
-            let full_url = Self::build_url(base_url, &relative_path);
+            let full_url = Self::build_url(base_url, download_url);
 
             for attempt in 1..=MAX_RETRIES_PER_MIRROR {
                 info!("[Candidate {}/{} | Attempt {}/{}] Downloading book from {}", idx + 1, candidates.len(), attempt, MAX_RETRIES_PER_MIRROR, full_url);

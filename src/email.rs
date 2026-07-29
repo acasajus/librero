@@ -3,7 +3,7 @@ use anyhow::{anyhow, Context, Result};
 use lettre::message::{header::ContentType, Attachment, MultiPart, SinglePart};
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{Message, SmtpTransport, Transport};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 /// Email Sender Service using Gmail SMTP
 #[derive(Clone, Debug)]
@@ -49,12 +49,12 @@ impl EmailSender {
             }
             Err(e) => {
                 info!("SMTP connection check info: {}", e);
-                Ok(()) // Valid transport built
+                Ok(())
             }
         }
     }
 
-    /// Send a book file attachment to a recipient email address
+    /// Send a book file attachment to a recipient email address (e.g. Kindle address)
     pub fn send_book_attachment(
         &self,
         recipient_email: &str,
@@ -63,7 +63,7 @@ impl EmailSender {
         file_bytes: &[u8],
         extension: &str,
     ) -> Result<()> {
-        info!("Sending book attachment '{}' ({}) via SMTP to '{}'", book_title, file_name, recipient_email);
+        info!("Sending book attachment '{}' ({}, {} bytes) via SMTP to '{}'", book_title, file_name, file_bytes.len(), recipient_email);
 
         let mime_type = match extension.to_lowercase().as_str() {
             "epub" => "application/epub+zip",
@@ -84,9 +84,15 @@ impl EmailSender {
             book_title, file_name
         );
 
+        let from_addr = if self.config.from_email.is_empty() {
+            &self.config.username
+        } else {
+            &self.config.from_email
+        };
+
         let email = Message::builder()
-            .from(self.config.from_email.parse().context("Invalid from_email address")?)
-            .to(recipient_email.parse().context("Invalid recipient_email address")?)
+            .from(from_addr.parse().context(format!("Invalid from_email address: '{}'", from_addr))?)
+            .to(recipient_email.parse().context(format!("Invalid recipient_email address: '{}'", recipient_email))?)
             .subject(format!("Book: {}", book_title))
             .multipart(
                 MultiPart::mixed()
@@ -96,7 +102,11 @@ impl EmailSender {
             .context("Failed to build multipart email message")?;
 
         let transport = self.build_transport()?;
-        transport.send(&email).context("Failed to deliver email via SMTP transport")?;
+        
+        if let Err(err) = transport.send(&email) {
+            error!("SMTP Delivery Failed to '{}': {:?}", recipient_email, err);
+            return Err(anyhow!("SMTP Delivery Failed: {}", err));
+        }
 
         info!("Successfully delivered email for '{}' to '{}'", book_title, recipient_email);
         Ok(())
