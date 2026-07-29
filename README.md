@@ -67,9 +67,10 @@ cargo run
 
 ## 🤖 Telegram Bot Commands
 
-| Command | Action |
+| Command / Action | Description |
 | :--- | :--- |
-| **`doctor`** or **`/doctor`** | Checks system health (Tor connection, Z-Library quota, SMTP Server, Turso DB) |
-| **`history`** or **`/history`** | Displays your recent download history from the Turso/SQLite database |
-| **`/search <query>`** | Searches Z-Library over Tor: <br>• **If none found**: Displays "No books found".<br>• **If ≤ 10 books**: Displays detailed info cards for each book with `📥 Download` buttons.<br>• **If > 10 books**: Displays alert and top 10 full info cards with download buttons. |
-| **`[📥 Download]` Button** | Downloads book over Tor, saves to `./downloads/<user_id>/`, logs record in Turso DB, and sends file attachment via SMTP Server |
+| **`doctor`** or **`/doctor`** | Checks system health in parallel (Tor connection, Z-Library quota, SMTP Server, Turso DB) |
+| **`history`** or **`/history`** | Displays your recent download history with `[📧 Re-send Email]` & `[💬 Send to Telegram]` buttons |
+| **`/search <query>`** | Searches Z-Library over Tor and returns top 10 full information cards with download buttons |
+| **`[📧 Send Email]` Button** | Downloads book over Tor, saves to `./downloads/<user_id>/`, logs in Turso DB, and sends file via SMTP |
+| **`[💬 Send to Telegram]` Button** | Downloads book over Tor and sends the document file directly into your Telegram chat |

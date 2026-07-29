@@ -7,7 +7,7 @@ use anyhow::Result;
 use std::path::PathBuf;
 use std::sync::Arc;
 use teloxide::prelude::*;
-use teloxide::types::{BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, ParseMode};
+use teloxide::types::{BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, ParseMode};
 use tokio::fs;
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
@@ -224,7 +224,7 @@ async fn handle_doctor_cmd(bot: &Bot, msg: &Message, state: &AppState) -> Respon
     Ok(())
 }
 
-/// View download history (`/history` command) with re-send buttons
+/// View download history (`/history` command) with re-send & Telegram client download buttons
 async fn handle_history_cmd(bot: &Bot, msg: &Message, state: &AppState) -> ResponseResult<()> {
     let user_obj = msg.from.as_ref().unwrap();
     let user_id = user_obj.id.0 as i64;
@@ -276,11 +276,12 @@ async fn handle_history_cmd(bot: &Bot, msg: &Message, state: &AppState) -> Respo
                     html_escape(&r.local_path)
                 );
 
-                let callback_data = format!("resend_{}", r.id);
-                let button_label = format!("🔄 Re-send to Email ({})", r.user_email);
+                let email_data = format!("resend_email_{}", r.id);
+                let tg_data = format!("resend_tg_{}", r.id);
 
                 let keyboard = InlineKeyboardMarkup::new(vec![vec![
-                    InlineKeyboardButton::callback(button_label, callback_data),
+                    InlineKeyboardButton::callback("📧 Re-send Email", email_data),
+                    InlineKeyboardButton::callback("💬 Send to Telegram", tg_data),
                 ]]);
 
                 bot.send_message(msg.chat.id, item_text)
@@ -302,7 +303,7 @@ async fn handle_history_cmd(bot: &Bot, msg: &Message, state: &AppState) -> Respo
     Ok(())
 }
 
-/// Format a rich information card for a single book with full title & complete metadata
+/// Format a rich information card for a single book with Email & Telegram client download buttons
 fn send_book_card(index: usize, book: &Book) -> (String, InlineKeyboardMarkup) {
     let ext = book.extension.as_deref().unwrap_or("N/A").to_uppercase();
     let size = book.filesize_string.as_deref().unwrap_or("N/A");
@@ -328,11 +329,12 @@ fn send_book_card(index: usize, book: &Book) -> (String, InlineKeyboardMarkup) {
         size
     );
 
-    let callback_data = format!("dl_{}_{}", book.id, hash);
-    let button_label = format!("📥 Download {} ({})", ext, size);
+    let email_data = format!("dl_email_{}_{}", book.id, hash);
+    let tg_data = format!("dl_tg_{}_{}", book.id, hash);
 
     let keyboard = InlineKeyboardMarkup::new(vec![vec![
-        InlineKeyboardButton::callback(button_label, callback_data),
+        InlineKeyboardButton::callback(format!("📧 Send Email ({})", ext), email_data),
+        InlineKeyboardButton::callback("💬 Send to Telegram", tg_data),
     ]]);
 
     (card_text, keyboard)
@@ -404,7 +406,7 @@ async fn handle_search_cmd(bot: &Bot, msg: &Message, state: &AppState, query: &s
     Ok(())
 }
 
-/// Handle inline keyboard button callbacks for book downloads & re-sends
+/// Handle inline keyboard button callbacks for book downloads (Email / Telegram) & re-sends
 async fn handle_callback(bot: Bot, q: CallbackQuery, state: AppState) -> ResponseResult<()> {
     let user_id = q.from.id.0 as i64;
 
@@ -427,20 +429,12 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, state: AppState) -> Respons
         None => return Ok(()),
     };
 
-    // Case 1: Re-send a previously downloaded book from history
-    if data.starts_with("resend_") {
-        bot.answer_callback_query(&q.id)
-            .text("⏳ Processing re-send request...")
-            .send()
-            .await?;
+    // Case 1: Re-send via Email from history
+    if data.starts_with("resend_email_") {
+        bot.answer_callback_query(&q.id).text("⏳ Processing email re-send...").send().await?;
 
-        let db_id_str = data.trim_start_matches("resend_");
-        let db_id: i64 = match db_id_str.parse() {
-            Ok(id) => id,
-            Err(_) => return Ok(()),
-        };
-
-        let status_msg = bot.send_message(chat_id, format!("🔄 Preparing re-send for history record #{}...", db_id))
+        let db_id: i64 = data.trim_start_matches("resend_email_").parse().unwrap_or(0);
+        let status_msg = bot.send_message(chat_id, format!("🔄 Preparing email re-send for record #{}...", db_id))
             .parse_mode(ParseMode::Html)
             .send()
             .await?;
@@ -462,22 +456,12 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, state: AppState) -> Respons
             state.config.find_user_email(user_id).unwrap_or_default()
         };
 
-        if recipient_email.is_empty() {
-            bot.edit_message_text(chat_id, status_msg.id, "❌ Target recipient email not configured.")
-                .parse_mode(ParseMode::Html)
-                .send()
-                .await?;
-            return Ok(());
-        }
-
-        // Read bytes from local disk if available
         let file_path = PathBuf::from(&record.local_path);
         let book_bytes = if file_path.exists() {
-            info!("Reading local file bytes from '{}' for re-send...", record.local_path);
             match fs::read(&file_path).await {
                 Ok(b) => b,
                 Err(e) => {
-                    bot.edit_message_text(chat_id, status_msg.id, format!("❌ Failed to read local file: {}", html_escape(&e.to_string())))
+                    bot.edit_message_text(chat_id, status_msg.id, format!("❌ Failed to read file: {}", html_escape(&e.to_string())))
                         .parse_mode(ParseMode::Html)
                         .send()
                         .await?;
@@ -485,16 +469,9 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, state: AppState) -> Respons
                 }
             }
         } else {
-            // Local file missing -> re-download over Tor
-            bot.edit_message_text(chat_id, status_msg.id, format!("⏬ Local file missing. Re-downloading book ID {} over Tor...", record.book_id))
-                .parse_mode(ParseMode::Html)
-                .send()
-                .await
-                .ok();
-
             let client = state.client.lock().await;
-            let url = match client.get_download_url(record.book_id, "nohash").await {
-                Ok(u) => u,
+            let info = match client.get_download_info(record.book_id, "nohash").await {
+                Ok(i) => i,
                 Err(e) => {
                     bot.edit_message_text(chat_id, status_msg.id, format!("❌ Re-download failed: {}", html_escape(&e.to_string())))
                         .parse_mode(ParseMode::Html)
@@ -503,8 +480,7 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, state: AppState) -> Respons
                     return Ok(());
                 }
             };
-
-            match client.download_book_bytes(&url).await {
+            match client.download_book_bytes(&info.url).await {
                 Ok(b) => b,
                 Err(e) => {
                     bot.edit_message_text(chat_id, status_msg.id, format!("❌ Re-download failed: {}", html_escape(&e.to_string())))
@@ -519,54 +495,75 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, state: AppState) -> Respons
         let ext = record.extension.as_deref().unwrap_or("epub");
         let file_name = format!("book_{}.{}", record.book_id, ext);
 
-        bot.edit_message_text(chat_id, status_msg.id, format!("📧 Sending book via SMTP to <code>{}</code>...", html_escape(&recipient_email)))
-            .parse_mode(ParseMode::Html)
-            .send()
-            .await
-            .ok();
-
-        match state.email.send_book_attachment(
-            &recipient_email,
-            &record.book_title,
-            &file_name,
-            &book_bytes,
-            ext,
-        ) {
+        match state.email.send_book_attachment(&recipient_email, &record.book_title, &file_name, &book_bytes, ext) {
             Ok(_) => {
                 let _ = state.db.update_sent_via_email(db_id, true);
-                bot.edit_message_text(
-                    chat_id,
-                    status_msg.id,
-                    format!(
-                        "✅ <b>Re-send Successful!</b>\n\n\
-                        📖 <b>Book:</b> {}\n\
-                        📧 <b>Delivered to:</b> <code>{}</code> via SMTP",
-                        html_escape(&record.book_title),
-                        html_escape(&recipient_email)
-                    ),
-                )
-                .parse_mode(ParseMode::Html)
-                .send()
-                .await?;
+                bot.edit_message_text(chat_id, status_msg.id, format!("✅ <b>Re-sent to Email!</b>\n\n📧 Delivered to <code>{}</code>", html_escape(&recipient_email)))
+                    .parse_mode(ParseMode::Html)
+                    .send()
+                    .await?;
             }
             Err(e) => {
-                error!("Re-send email failed for record #{}: {}", db_id, e);
-                bot.edit_message_text(
-                    chat_id,
-                    status_msg.id,
-                    format!("❌ <b>SMTP Re-send Failed:</b> <code>{}</code>", html_escape(&e.to_string())),
-                )
-                .parse_mode(ParseMode::Html)
-                .send()
-                .await?;
+                bot.edit_message_text(chat_id, status_msg.id, format!("❌ <b>SMTP Delivery Failed:</b> <code>{}</code>", html_escape(&e.to_string())))
+                    .parse_mode(ParseMode::Html)
+                    .send()
+                    .await?;
             }
         }
-
         return Ok(());
     }
 
-    // Case 2: Clicked Download button
-    if !data.starts_with("dl_") {
+    // Case 2: Send document directly to Telegram Client from history
+    if data.starts_with("resend_tg_") {
+        bot.answer_callback_query(&q.id).text("⏳ Sending file to Telegram chat...").send().await?;
+
+        let db_id: i64 = data.trim_start_matches("resend_tg_").parse().unwrap_or(0);
+        let status_msg = bot.send_message(chat_id, format!("📄 Preparing file upload for Telegram chat (record #{})...", db_id))
+            .parse_mode(ParseMode::Html)
+            .send()
+            .await?;
+
+        let record = match state.db.get_record_by_id(db_id) {
+            Ok(Some(r)) => r,
+            _ => {
+                bot.edit_message_text(chat_id, status_msg.id, "❌ History record not found in database.")
+                    .parse_mode(ParseMode::Html)
+                    .send()
+                    .await?;
+                return Ok(());
+            }
+        };
+
+        let file_path = PathBuf::from(&record.local_path);
+        let ext = record.extension.as_deref().unwrap_or("epub");
+        let file_name = format!("book_{}.{}", record.book_id, ext);
+
+        if file_path.exists() {
+            let input_file = InputFile::file(&file_path).file_name(file_name);
+            let caption = format!("📖 <b>{}</b>\n👤 Author: {}", html_escape(&record.book_title), html_escape(record.book_author.as_deref().unwrap_or("Unknown")));
+
+            match bot.send_document(chat_id, input_file).caption(caption).parse_mode(ParseMode::Html).send().await {
+                Ok(_) => {
+                    bot.delete_message(chat_id, status_msg.id).send().await.ok();
+                }
+                Err(e) => {
+                    bot.edit_message_text(chat_id, status_msg.id, format!("❌ Failed to send document to Telegram: {}", html_escape(&e.to_string())))
+                        .parse_mode(ParseMode::Html)
+                        .send()
+                        .await?;
+                }
+            }
+        } else {
+            bot.edit_message_text(chat_id, status_msg.id, "❌ Local file missing from disk.").parse_mode(ParseMode::Html).send().await?;
+        }
+        return Ok(());
+    }
+
+    // Case 3: Download book and send (Email or Telegram client)
+    let is_tg_download = data.starts_with("dl_tg_");
+    let is_email_download = data.starts_with("dl_email_") || data.starts_with("dl_");
+
+    if !is_tg_download && !is_email_download {
         return Ok(());
     }
 
@@ -575,7 +572,15 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, state: AppState) -> Respons
         .send()
         .await?;
 
-    let parts: Vec<&str> = data.trim_start_matches("dl_").splitn(2, '_').collect();
+    let payload = if is_tg_download {
+        data.trim_start_matches("dl_tg_")
+    } else if data.starts_with("dl_email_") {
+        data.trim_start_matches("dl_email_")
+    } else {
+        data.trim_start_matches("dl_")
+    };
+
+    let parts: Vec<&str> = payload.splitn(2, '_').collect();
     if parts.len() < 2 {
         return Ok(());
     }
@@ -644,59 +649,62 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, state: AppState) -> Respons
         info!("Saved book locally to '{}'", local_path_str);
     }
 
-    // 3. Send email attachment via SMTP to configured user email
+    // 3. Handle Delivery Target (Telegram document upload OR Email attachment)
     let recipient_email = state.config.find_user_email(user_id).unwrap_or_default();
-    let (email_sent, email_err_msg): (bool, Option<String>) = if !recipient_email.is_empty() {
-        bot.edit_message_text(chat_id, status_msg.id, format!("📧 Sending book via SMTP to <code>{}</code>...", html_escape(&recipient_email)))
+    let mut email_sent = false;
+
+    if is_tg_download {
+        bot.edit_message_text(chat_id, status_msg.id, "📄 Uploading file directly to Telegram chat...")
             .parse_mode(ParseMode::Html)
             .send()
             .await
             .ok();
 
-        match state.email.send_book_attachment(
-            &recipient_email,
-            &dl_info.book.title,
-            &file_name,
-            &book_bytes,
-            ext,
-        ) {
-            Ok(_) => (true, None),
-            Err(e) => {
-                error!("Failed sending email to {}: {}", recipient_email, e);
-                (false, Some(e.to_string()))
-            }
+        let input_file = InputFile::file(&local_file_path).file_name(file_name);
+        let caption = format!("📖 <b>{}</b>\n👤 Author: {}", html_escape(&dl_info.book.title), html_escape(dl_info.book.author.as_deref().unwrap_or("Unknown")));
+
+        if let Err(e) = bot.send_document(chat_id, input_file).caption(caption).parse_mode(ParseMode::Html).send().await {
+            error!("Failed to send document to Telegram chat: {}", e);
+        } else {
+            bot.delete_message(chat_id, status_msg.id).send().await.ok();
         }
     } else {
-        (false, Some("Recipient email not configured in config.toml".into()))
-    };
+        // Send via Email
+        if !recipient_email.is_empty() {
+            bot.edit_message_text(chat_id, status_msg.id, format!("📧 Sending book via SMTP to <code>{}</code>...", html_escape(&recipient_email)))
+                .parse_mode(ParseMode::Html)
+                .send()
+                .await
+                .ok();
+
+            match state.email.send_book_attachment(&recipient_email, &dl_info.book.title, &file_name, &book_bytes, ext) {
+                Ok(_) => { email_sent = true; }
+                Err(e) => { error!("Failed sending email to {}: {}", recipient_email, e); }
+            }
+        }
+
+        let confirmation_text = format!(
+            "✅ <b>Download Complete!</b>\n\n\
+            📖 <b>Book:</b> {}\n\
+            📁 <b>Saved Locally:</b> <code>{}</code>\n\
+            📧 <b>Email:</b> {}\n\
+            📦 <b>Size:</b> {} bytes",
+            html_escape(&dl_info.book.title),
+            html_escape(&local_path_str),
+            if email_sent { format!("Sent to <code>{}</code>", html_escape(&recipient_email)) } else { "Failed / Not configured".into() },
+            book_bytes.len()
+        );
+
+        bot.edit_message_text(chat_id, status_msg.id, confirmation_text)
+            .parse_mode(ParseMode::Html)
+            .send()
+            .await?;
+    }
 
     // 4. Record real book metadata entry in Turso DB
     let mut book_record = dl_info.book;
     book_record.filesize = Some(book_bytes.len() as u64);
-
     let _ = state.db.record_download(user_id, &recipient_email, &book_record, &local_path_str, email_sent);
-
-    // 5. Send final confirmation report to Telegram user
-    let email_status_str = if email_sent {
-        format!("Sent to <code>{}</code>", html_escape(&recipient_email))
-    } else if let Some(ref err) = email_err_msg {
-        format!("⚠️ Failed: <code>{}</code>", html_escape(err))
-    } else {
-        "Failed / Not configured".to_string()
-    };
-
-    let confirmation_text = format!(
-        "✅ <b>Download Complete!</b>\n\n\
-        📁 <b>Saved Locally:</b> <code>{}</code>\n\
-        📧 <b>Email:</b> {}\n\
-        📦 <b>Size:</b> {} bytes",
-        html_escape(&local_path_str), email_status_str, book_bytes.len()
-    );
-
-    bot.edit_message_text(chat_id, status_msg.id, confirmation_text)
-        .parse_mode(ParseMode::Html)
-        .send()
-        .await?;
 
     Ok(())
 }
