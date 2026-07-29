@@ -9,7 +9,7 @@ run:
 
 # Live reload: watch source files and automatically restart on change
 watch:
-    cargo watch -x "run --mode embedded"
+    ./watch.sh
 
 # Check project compilation
 check:
