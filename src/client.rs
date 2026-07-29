@@ -12,6 +12,13 @@ use tracing::{debug, error, info, warn};
 const MAX_RETRIES_PER_MIRROR: u32 = 3;
 const RETRY_BACKOFF_MS: u64 = 1500;
 
+/// Download Info returned when resolving a book download link
+#[derive(Debug, Clone)]
+pub struct DownloadInfo {
+    pub url: String,
+    pub book: Book,
+}
+
 /// Z-Library client over Tor network
 #[derive(Debug)]
 pub struct ZLibraryClient {
@@ -342,9 +349,9 @@ impl ZLibraryClient {
         Err(last_err)
     }
 
-    /// Get direct download URL for a given book with retries
-    pub async fn get_download_url(&self, book_id: u64, book_hash: &str) -> Result<String> {
-        info!("Fetching direct download link for book ID {} (hash: {})...", book_id, book_hash);
+    /// Get direct download URL and full book metadata for a given book
+    pub async fn get_download_info(&self, book_id: u64, book_hash: &str) -> Result<DownloadInfo> {
+        info!("Fetching direct download link & metadata for book ID {} (hash: {})...", book_id, book_hash);
         let mut last_err = anyhow!("No onion candidates configured");
 
         let candidates = self.config.onion_candidates();
@@ -369,15 +376,63 @@ impl ZLibraryClient {
                         let text = res.text().await?;
                         let json_val: serde_json::Value = serde_json::from_str(&text)?;
 
-                        let dl_url = json_val.get("file").and_then(|f| f.get("downloadLink").or_else(|| f.get("url")).or_else(|| f.get("dlUrl"))).and_then(|u| u.as_str())
-                            .or_else(|| json_val.get("response").and_then(|r| r.get("file")).and_then(|f| f.get("downloadLink").or_else(|| f.get("url"))).and_then(|u| u.as_str()))
+                        let file_obj = json_val.get("file").or_else(|| json_val.get("response").and_then(|r| r.get("file")));
+
+                        let dl_url = file_obj.and_then(|f| f.get("downloadLink").or_else(|| f.get("url")).or_else(|| f.get("dlUrl"))).and_then(|u| u.as_str())
                             .or_else(|| json_val.get("response").and_then(|r| r.get("url").or_else(|| r.get("downloadLink"))).and_then(|u| u.as_str()))
                             .or_else(|| json_val.get("downloadLink").and_then(|u| u.as_str()))
                             .or_else(|| json_val.get("url").and_then(|u| u.as_str()))
                             .ok_or_else(|| anyhow!("Download URL not found in response: {}", text))?;
 
-                        info!("Resolved download URL for book {}: {}", book_id, dl_url);
-                        return Ok(dl_url.to_string());
+                        // Extract author
+                        let author = file_obj.and_then(|f| f.get("author")).and_then(|a| a.as_str()).map(|s| s.to_string());
+
+                        // Extract extension
+                        let extension = file_obj.and_then(|f| f.get("extension")).and_then(|e| e.as_str()).map(|s| s.to_string());
+
+                        // Extract title from description, title, or filename parameter in dl_url
+                        let mut title = file_obj.and_then(|f| f.get("description").or_else(|| f.get("title"))).and_then(|t| t.as_str()).map(|s| s.to_string());
+
+                        if title.is_none() || title.as_deref() == Some("") {
+                            if let Ok(parsed_url) = reqwest::Url::parse(dl_url) {
+                                for (k, v) in parsed_url.query_pairs() {
+                                    if k == "filename" {
+                                        let decoded = v.to_string();
+                                        // Clean filename suffix tags like (z-library.sk)
+                                        let clean_title = decoded.split(" (z-library").next().unwrap_or(&decoded).trim().to_string();
+                                        title = Some(clean_title);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+
+                        let final_title = title.unwrap_or_else(|| format!("Book {}", book_id));
+
+                        let book_metadata = Book {
+                            id: book_id,
+                            title: final_title,
+                            author,
+                            publisher: None,
+                            year: None,
+                            language: None,
+                            extension,
+                            filesize: None,
+                            filesize_string: None,
+                            cover: None,
+                            hash: Some(book_hash.to_string()),
+                            description: None,
+                            rating: None,
+                            quality: None,
+                            download_url: Some(dl_url.to_string()),
+                        };
+
+                        info!("Resolved download info for book {}: title='{}', author='{:?}'", book_id, book_metadata.title, book_metadata.author);
+
+                        return Ok(DownloadInfo {
+                            url: dl_url.to_string(),
+                            book: book_metadata,
+                        });
                     }
                     Err(e) => {
                         let err_msg = e.to_string();
@@ -396,6 +451,12 @@ impl ZLibraryClient {
         }
 
         Err(last_err)
+    }
+
+    /// Backwards-compatible wrapper to get download URL
+    pub async fn get_download_url(&self, book_id: u64, book_hash: &str) -> Result<String> {
+        let info = self.get_download_info(book_id, book_hash).await?;
+        Ok(info.url)
     }
 
     /// Download book binary bytes from the given URL over Tor with retries across onion candidates

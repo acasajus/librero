@@ -592,10 +592,10 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, state: AppState) -> Respons
         .await?;
 
     // 1. Resolve download URL & fetch bytes over Tor
-    let (dl_url, book_bytes) = {
+    let (dl_info, book_bytes) = {
         let client = state.client.lock().await;
-        let url = match client.get_download_url(book_id, book_hash).await {
-            Ok(u) => u,
+        let info = match client.get_download_info(book_id, book_hash).await {
+            Ok(i) => i,
             Err(e) => {
                 bot.edit_message_text(chat_id, status_msg.id, format!("❌ Failed to get download URL: {}", html_escape(&e.to_string())))
                     .parse_mode(ParseMode::Html)
@@ -605,13 +605,13 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, state: AppState) -> Respons
             }
         };
 
-        bot.edit_message_text(chat_id, status_msg.id, "⏬ Downloading book binary file over Tor...")
+        bot.edit_message_text(chat_id, status_msg.id, format!("⏬ Downloading <b>{}</b> over Tor...", html_escape(&info.book.title)))
             .parse_mode(ParseMode::Html)
             .send()
             .await
             .ok();
 
-        let bytes = match client.download_book_bytes(&url).await {
+        let bytes = match client.download_book_bytes(&info.url).await {
             Ok(b) => b,
             Err(e) => {
                 bot.edit_message_text(chat_id, status_msg.id, format!("❌ Download failed: {}", html_escape(&e.to_string())))
@@ -622,10 +622,10 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, state: AppState) -> Respons
             }
         };
 
-        (url, bytes)
+        (info, bytes)
     };
 
-    let ext = if dl_url.contains(".epub") { "epub" } else if dl_url.contains(".pdf") { "pdf" } else { "bin" };
+    let ext = dl_info.book.extension.as_deref().unwrap_or("epub");
     let file_name = format!("book_{}.{}", book_id, ext);
 
     // 2. Save locally into ./downloads/<user_id>/<file_name>
@@ -644,7 +644,7 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, state: AppState) -> Respons
         info!("Saved book locally to '{}'", local_path_str);
     }
 
-    // 3. Send email attachment via Gmail SMTP to configured user email
+    // 3. Send email attachment via SMTP to configured user email
     let recipient_email = state.config.find_user_email(user_id).unwrap_or_default();
     let (email_sent, email_err_msg): (bool, Option<String>) = if !recipient_email.is_empty() {
         bot.edit_message_text(chat_id, status_msg.id, format!("📧 Sending book via SMTP to <code>{}</code>...", html_escape(&recipient_email)))
@@ -655,7 +655,7 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, state: AppState) -> Respons
 
         match state.email.send_book_attachment(
             &recipient_email,
-            &format!("Book {}", book_id),
+            &dl_info.book.title,
             &file_name,
             &book_bytes,
             ext,
@@ -670,26 +670,11 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, state: AppState) -> Respons
         (false, Some("Recipient email not configured in config.toml".into()))
     };
 
-    // 4. Record entry in Turso DB
-    let dummy_book = Book {
-        id: book_id,
-        title: format!("Book {}", book_id),
-        author: None,
-        publisher: None,
-        year: None,
-        language: None,
-        extension: Some(ext.to_string()),
-        filesize: Some(book_bytes.len() as u64),
-        filesize_string: None,
-        cover: None,
-        hash: Some(book_hash.to_string()),
-        description: None,
-        rating: None,
-        quality: None,
-        download_url: Some(dl_url),
-    };
+    // 4. Record real book metadata entry in Turso DB
+    let mut book_record = dl_info.book;
+    book_record.filesize = Some(book_bytes.len() as u64);
 
-    let _ = state.db.record_download(user_id, &recipient_email, &dummy_book, &local_path_str, email_sent);
+    let _ = state.db.record_download(user_id, &recipient_email, &book_record, &local_path_str, email_sent);
 
     // 5. Send final confirmation report to Telegram user
     let email_status_str = if email_sent {
