@@ -57,28 +57,13 @@ async fn main() -> Result<()> {
     let userid = cfg.auth.remix_userid.clone();
     let userkey = cfg.auth.remix_userkey.clone();
 
-    let mut client = if let (Some(uid), Some(ukey)) = (userid, userkey) {
+    let client = if let (Some(uid), Some(ukey)) = (userid, userkey) {
         ZLibraryClient::with_session(tor_config, uid, ukey)?
     } else {
         ZLibraryClient::new(tor_config)?
     };
 
-    // 5. Automatic Login on Service Startup
-    if let (Some(ref email_str), Some(ref pass_str)) = (&cfg.auth.email, &cfg.auth.password) {
-        if !email_str.is_empty() && !pass_str.is_empty() {
-            info!("Automatically authenticating to Z-Library over Tor for {}...", email_str);
-            match client.login(email_str, pass_str).await {
-                Ok(profile) => {
-                    info!("Z-Library Authentication Successful! User: '{:?}'", profile.name);
-                }
-                Err(e) => {
-                    warn!("Z-Library Login Warning (will retry during search/doctor): {}", e);
-                }
-            }
-        }
-    }
-
-    // 6. Build AppState & Run Telegram Bot Daemon
+    // 5. Build Shared AppState
     let state = AppState {
         config: cfg,
         client: Arc::new(Mutex::new(client)),
@@ -86,7 +71,27 @@ async fn main() -> Result<()> {
         email,
     };
 
-    info!("Librero Daemon is active and listening for Telegram orders.");
+    // 6. Spawn Background Z-Library Auto-Login Task (Concurrently with Telegram Bot Startup)
+    let bg_state = state.clone();
+    tokio::spawn(async move {
+        if let (Some(ref email_str), Some(ref pass_str)) = (&bg_state.config.auth.email, &bg_state.config.auth.password) {
+            if !email_str.is_empty() && !pass_str.is_empty() {
+                info!("Background Z-Library auto-login task starting over Tor for {}...", email_str);
+                let mut client = bg_state.client.lock().await;
+                match client.login(email_str, pass_str).await {
+                    Ok(profile) => {
+                        info!("Z-Library Authentication Successful! User: '{:?}'", profile.name);
+                    }
+                    Err(e) => {
+                        warn!("Background Z-Library login warning (will auto-retry on search/doctor): {}", e);
+                    }
+                }
+            }
+        }
+    });
+
+    // 7. Start Telegram Bot Listener Daemon Immediately
+    info!("Librero Daemon is active. Telegram Bot is online and listening for orders.");
     start_bot(state).await?;
 
     Ok(())

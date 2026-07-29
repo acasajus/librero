@@ -89,6 +89,45 @@ impl Database {
         Ok(id)
     }
 
+    /// Query a specific download record by database ID
+    pub fn get_record_by_id(&self, id: i64) -> Result<Option<DownloadRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, telegram_user_id, user_email, book_id, book_title, book_author, extension, filesize, local_path, sent_via_email, downloaded_at
+             FROM downloads
+             WHERE id = ?1",
+        )?;
+
+        let mut rows = stmt.query(params![id])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(DownloadRecord {
+                id: row.get(0)?,
+                telegram_user_id: row.get(1)?,
+                user_email: row.get(2)?,
+                book_id: row.get(3)?,
+                book_title: row.get(4)?,
+                book_author: row.get(5)?,
+                extension: row.get(6)?,
+                filesize: row.get(7)?,
+                local_path: row.get(8)?,
+                sent_via_email: row.get(9)?,
+                downloaded_at: row.get(10)?,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Update email delivery status for a record
+    pub fn update_sent_via_email(&self, id: i64, sent: bool) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE downloads SET sent_via_email = ?1 WHERE id = ?2",
+            params![sent, id],
+        )?;
+        Ok(())
+    }
+
     /// Query recent download history for a specific Telegram user ID
     pub fn get_user_history(&self, telegram_user_id: i64, limit: usize) -> Result<Vec<DownloadRecord>> {
         let conn = self.conn.lock().unwrap();

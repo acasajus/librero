@@ -33,7 +33,7 @@ pub async fn start_bot(state: AppState) -> Result<()> {
         BotCommand::new("start", "Start the bot and view usage instructions"),
         BotCommand::new("search", "Search books on Z-Library (e.g. /search rust)"),
         BotCommand::new("doctor", "Check Tor, Z-Library quota, Gmail SMTP & DB health"),
-        BotCommand::new("history", "View your recent download history"),
+        BotCommand::new("history", "View your recent download history & re-send books"),
         BotCommand::new("help", "Display help and command menu"),
     ];
 
@@ -90,7 +90,7 @@ async fn handle_message(bot: Bot, msg: Message, state: AppState) -> ResponseResu
                 Available Commands:\n\
                 • <code>/search &lt;query&gt;</code> - Search for books on Z-Library\n\
                 • <code>/doctor</code> - Run system health diagnostics\n\
-                • <code>/history</code> - View your download history\n\
+                • <code>/history</code> - View download history & re-send books\n\
                 • <code>/help</code> - Show this menu\n\n\
                 <i>You can also send any book title/author directly to search!</i>"
             );
@@ -201,7 +201,7 @@ async fn handle_doctor_cmd(bot: &Bot, msg: &Message, state: &AppState) -> Respon
     Ok(())
 }
 
-/// View download history (`/history` command)
+/// View download history (`/history` command) with re-send buttons
 async fn handle_history_cmd(bot: &Bot, msg: &Message, state: &AppState) -> ResponseResult<()> {
     let user_obj = msg.from.as_ref().unwrap();
     let user_id = user_obj.id.0 as i64;
@@ -218,7 +218,13 @@ async fn handle_history_cmd(bot: &Bot, msg: &Message, state: &AppState) -> Respo
                 return Ok(());
             }
 
-            let mut text = format!("📜 <b>Your Recent Download History (Latest {}):</b>\n\n", records.len());
+            bot.send_message(
+                msg.chat.id,
+                format!("📜 <b>Your Recent Download History (Latest {}):</b>", records.len()),
+            )
+            .parse_mode(ParseMode::Html)
+            .send()
+            .await?;
 
             for (idx, r) in records.iter().enumerate() {
                 let ext = r.extension.as_deref().unwrap_or("N/A").to_uppercase();
@@ -229,25 +235,37 @@ async fn handle_history_cmd(bot: &Bot, msg: &Message, state: &AppState) -> Respo
                     "N/A".to_string()
                 };
 
-                let email_icon = if r.sent_via_email { "📧 Sent" } else { "⚠️ Email Failed" };
+                let email_status = if r.sent_via_email { "📧 Sent" } else { "⚠️ Not Sent / Failed" };
 
-                text.push_str(&format!(
-                    "{}. 📖 <b>{}</b>\n   👤 Author: {}\n   📅 Date: <code>{}</code>\n   📁 {} ({}) | {}\n   💾 Path: <code>{}</code>\n\n",
+                let item_text = format!(
+                    "{}. 📖 <b>{}</b>\n\n\
+                    👤 <b>Author:</b> {}\n\
+                    📅 <b>Date:</b> <code>{}</code>\n\
+                    📁 <b>Format:</b> {} ({}) | {}\n\
+                    💾 <b>Local Path:</b> <code>{}</code>",
                     idx + 1,
                     html_escape(&r.book_title),
                     html_escape(author),
                     r.downloaded_at,
                     ext,
                     size_str,
-                    email_icon,
+                    email_status,
                     html_escape(&r.local_path)
-                ));
-            }
+                );
 
-            bot.send_message(msg.chat.id, text)
-                .parse_mode(ParseMode::Html)
-                .send()
-                .await?;
+                let callback_data = format!("resend_{}", r.id);
+                let button_label = format!("🔄 Re-send to Email ({})", r.user_email);
+
+                let keyboard = InlineKeyboardMarkup::new(vec![vec![
+                    InlineKeyboardButton::callback(button_label, callback_data),
+                ]]);
+
+                bot.send_message(msg.chat.id, item_text)
+                    .parse_mode(ParseMode::Html)
+                    .reply_markup(keyboard)
+                    .send()
+                    .await?;
+            }
         }
         Err(err) => {
             error!("Failed to fetch user history: {}", err);
@@ -363,7 +381,7 @@ async fn handle_search_cmd(bot: &Bot, msg: &Message, state: &AppState, query: &s
     Ok(())
 }
 
-/// Handle inline keyboard button callbacks for book downloads
+/// Handle inline keyboard button callbacks for book downloads & re-sends
 async fn handle_callback(bot: Bot, q: CallbackQuery, state: AppState) -> ResponseResult<()> {
     let user_id = q.from.id.0 as i64;
 
@@ -386,6 +404,145 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, state: AppState) -> Respons
         None => return Ok(()),
     };
 
+    // Case 1: Re-send a previously downloaded book from history
+    if data.starts_with("resend_") {
+        bot.answer_callback_query(&q.id)
+            .text("⏳ Processing re-send request...")
+            .send()
+            .await?;
+
+        let db_id_str = data.trim_start_matches("resend_");
+        let db_id: i64 = match db_id_str.parse() {
+            Ok(id) => id,
+            Err(_) => return Ok(()),
+        };
+
+        let status_msg = bot.send_message(chat_id, format!("🔄 Preparing re-send for history record #{}...", db_id))
+            .parse_mode(ParseMode::Html)
+            .send()
+            .await?;
+
+        let record = match state.db.get_record_by_id(db_id) {
+            Ok(Some(r)) => r,
+            _ => {
+                bot.edit_message_text(chat_id, status_msg.id, "❌ History record not found in database.")
+                    .parse_mode(ParseMode::Html)
+                    .send()
+                    .await?;
+                return Ok(());
+            }
+        };
+
+        let recipient_email = if !record.user_email.is_empty() {
+            record.user_email.clone()
+        } else {
+            state.config.find_user_email(user_id).unwrap_or_default()
+        };
+
+        if recipient_email.is_empty() {
+            bot.edit_message_text(chat_id, status_msg.id, "❌ Target recipient email not configured.")
+                .parse_mode(ParseMode::Html)
+                .send()
+                .await?;
+            return Ok(());
+        }
+
+        // Read bytes from local disk if available
+        let file_path = PathBuf::from(&record.local_path);
+        let book_bytes = if file_path.exists() {
+            info!("Reading local file bytes from '{}' for re-send...", record.local_path);
+            match fs::read(&file_path).await {
+                Ok(b) => b,
+                Err(e) => {
+                    bot.edit_message_text(chat_id, status_msg.id, format!("❌ Failed to read local file: {}", html_escape(&e.to_string())))
+                        .parse_mode(ParseMode::Html)
+                        .send()
+                        .await?;
+                    return Ok(());
+                }
+            }
+        } else {
+            // Local file missing -> re-download over Tor
+            bot.edit_message_text(chat_id, status_msg.id, format!("⏬ Local file missing. Re-downloading book ID {} over Tor...", record.book_id))
+                .parse_mode(ParseMode::Html)
+                .send()
+                .await
+                .ok();
+
+            let client = state.client.lock().await;
+            let url = match client.get_download_url(record.book_id, "nohash").await {
+                Ok(u) => u,
+                Err(e) => {
+                    bot.edit_message_text(chat_id, status_msg.id, format!("❌ Re-download failed: {}", html_escape(&e.to_string())))
+                        .parse_mode(ParseMode::Html)
+                        .send()
+                        .await?;
+                    return Ok(());
+                }
+            };
+
+            match client.download_book_bytes(&url).await {
+                Ok(b) => b,
+                Err(e) => {
+                    bot.edit_message_text(chat_id, status_msg.id, format!("❌ Re-download failed: {}", html_escape(&e.to_string())))
+                        .parse_mode(ParseMode::Html)
+                        .send()
+                        .await?;
+                    return Ok(());
+                }
+            }
+        };
+
+        let ext = record.extension.as_deref().unwrap_or("epub");
+        let file_name = format!("book_{}.{}", record.book_id, ext);
+
+        bot.edit_message_text(chat_id, status_msg.id, format!("📧 Sending book via SMTP to <code>{}</code>...", html_escape(&recipient_email)))
+            .parse_mode(ParseMode::Html)
+            .send()
+            .await
+            .ok();
+
+        match state.email.send_book_attachment(
+            &recipient_email,
+            &record.book_title,
+            &file_name,
+            &book_bytes,
+            ext,
+        ) {
+            Ok(_) => {
+                let _ = state.db.update_sent_via_email(db_id, true);
+                bot.edit_message_text(
+                    chat_id,
+                    status_msg.id,
+                    format!(
+                        "✅ <b>Re-send Successful!</b>\n\n\
+                        📖 <b>Book:</b> {}\n\
+                        📧 <b>Delivered to:</b> <code>{}</code> via SMTP",
+                        html_escape(&record.book_title),
+                        html_escape(&recipient_email)
+                    ),
+                )
+                .parse_mode(ParseMode::Html)
+                .send()
+                .await?;
+            }
+            Err(e) => {
+                error!("Re-send email failed for record #{}: {}", db_id, e);
+                bot.edit_message_text(
+                    chat_id,
+                    status_msg.id,
+                    format!("❌ <b>SMTP Re-send Failed:</b> <code>{}</code>", html_escape(&e.to_string())),
+                )
+                .parse_mode(ParseMode::Html)
+                .send()
+                .await?;
+            }
+        }
+
+        return Ok(());
+    }
+
+    // Case 2: Clicked Download button
     if !data.starts_with("dl_") {
         return Ok(());
     }
@@ -466,7 +623,7 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, state: AppState) -> Respons
 
     // 3. Send email attachment via Gmail SMTP to configured user email
     let recipient_email = state.config.find_user_email(user_id).unwrap_or_default();
-    let email_sent = if !recipient_email.is_empty() {
+    let (email_sent, email_err_msg): (bool, Option<String>) = if !recipient_email.is_empty() {
         bot.edit_message_text(chat_id, status_msg.id, format!("📧 Sending book via SMTP to <code>{}</code>...", html_escape(&recipient_email)))
             .parse_mode(ParseMode::Html)
             .send()
@@ -480,14 +637,14 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, state: AppState) -> Respons
             &book_bytes,
             ext,
         ) {
-            Ok(_) => true,
+            Ok(_) => (true, None),
             Err(e) => {
                 error!("Failed sending email to {}: {}", recipient_email, e);
-                false
+                (false, Some(e.to_string()))
             }
         }
     } else {
-        false
+        (false, Some("Recipient email not configured in config.toml".into()))
     };
 
     // 4. Record entry in Turso DB
@@ -514,6 +671,8 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, state: AppState) -> Respons
     // 5. Send final confirmation report to Telegram user
     let email_status_str = if email_sent {
         format!("Sent to <code>{}</code>", html_escape(&recipient_email))
+    } else if let Some(ref err) = email_err_msg {
+        format!("⚠️ Failed: <code>{}</code>", html_escape(err))
     } else {
         "Failed / Not configured".to_string()
     };
