@@ -17,7 +17,7 @@ pub use config::{
 };
 pub use dashboard::start_dashboard_server;
 pub use db::Database;
-pub use email::{generate_kindle_test_epub, EmailSender};
+pub use email::{extract_epub_cover, generate_kindle_test_epub, EmailSender};
 pub use models::{Book, Credentials, SearchQuery, SessionTokens, UserProfile};
 pub use tor::{TorConfig, TorMode, DEFAULT_SOCKS5_PROXY, DEFAULT_ZLIB_ONION, FALLBACK_ZLIB_ONION};
 

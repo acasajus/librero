@@ -342,6 +342,26 @@ pub fn generate_kindle_test_epub() -> Vec<u8> {
     buf
 }
 
+/// Attempt to extract embedded cover image from an EPUB zip archive
+pub fn extract_epub_cover(epub_bytes: &[u8]) -> Option<(String, Vec<u8>)> {
+    let reader = std::io::Cursor::new(epub_bytes);
+    let mut archive = zip::ZipArchive::new(reader).ok()?;
+
+    for i in 0..archive.len() {
+        if let Ok(mut file) = archive.by_index(i) {
+            let name = file.name().to_lowercase();
+            if (name.contains("cover") || name.contains("image")) && (name.ends_with(".jpg") || name.ends_with(".jpeg") || name.ends_with(".png")) {
+                let ext = if name.ends_with(".png") { "png" } else { "jpg" };
+                let mut buf = Vec::new();
+                if std::io::Read::read_to_end(&mut file, &mut buf).is_ok() && !buf.is_empty() {
+                    return Some((ext.to_string(), buf));
+                }
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

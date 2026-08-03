@@ -2,7 +2,7 @@ use crate::client::ZLibraryClient;
 use crate::config::Config;
 use crate::db::Database;
 use crate::email::{extract_epub_metadata, format_attachment_filename, EmailSender};
-use crate::models::{Book, SearchQuery};
+use crate::models::{clean_book_title, Book, SearchQuery};
 use anyhow::Result;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -33,6 +33,7 @@ pub struct AppState {
     pub email: EmailSender,
     pub pending_custom_emails: Arc<Mutex<HashMap<i64, PendingCustomEmail>>>,
     pub search_cache: Arc<Mutex<HashMap<i64, (String, Vec<Book>)>>>,
+    pub history_cache: Arc<Mutex<HashMap<i64, (String, Vec<crate::db::DownloadRecord>)>>>,
 }
 
 /// Start the long-polling Telegram Bot daemon
@@ -204,6 +205,8 @@ async fn process_message(bot: Bot, msg: Message, state: AppState) -> ResponseRes
         }
         "/settings" => {
             let (pref, _) = state.db.get_user_setting(user_id).unwrap_or(("ask".into(), None));
+            let fmt_pref = state.db.get_preferred_format(user_id);
+
             let pref_str = match pref.as_str() {
                 "kindle" => "📧 Always Send to Kindle (1-Tap)",
                 "telegram" => "💬 Always Upload to Telegram Chat",
@@ -211,19 +214,24 @@ async fn process_message(bot: Bot, msg: Message, state: AppState) -> ResponseRes
             };
 
             let text = format!(
-                "⚙️ <b>1-Tap Delivery Preference</b>\n\n\
-                Current Setting: <b>{}</b>\n\n\
-                Select your default 1-Tap action when clicking book search cards:",
-                pref_str
+                "⚙️ <b>Delivery & Format Preferences</b>\n\n\
+                1️⃣ <b>1-Tap Delivery Mode:</b> <code>{}</code>\n\
+                2️⃣ <b>Preferred Book Format:</b> <code>{}</code>\n\n\
+                Select your preferences below:",
+                pref_str,
+                fmt_pref.to_uppercase()
             );
 
             let keyboard = InlineKeyboardMarkup::new(vec![
                 vec![
-                    InlineKeyboardButton::callback("📧 Always Send to Kindle", "set_pref_kindle"),
+                    InlineKeyboardButton::callback("📧 Always Kindle", "set_pref_kindle"),
                     InlineKeyboardButton::callback("💬 Always Telegram", "set_pref_telegram"),
+                    InlineKeyboardButton::callback("❓ Ask Every Time", "set_pref_ask"),
                 ],
                 vec![
-                    InlineKeyboardButton::callback("❓ Ask Every Time", "set_pref_ask"),
+                    InlineKeyboardButton::callback("📘 Prefer EPUB", "set_fmt_epub"),
+                    InlineKeyboardButton::callback("📄 Prefer PDF", "set_fmt_pdf"),
+                    InlineKeyboardButton::callback("📖 Prefer MOBI", "set_fmt_mobi"),
                 ],
             ]);
 
@@ -239,7 +247,9 @@ async fn process_message(bot: Bot, msg: Message, state: AppState) -> ResponseRes
             Ok(())
         }
         "/history" | "history" => {
-            handle_history_cmd(&bot, &msg, &state).await?;
+            let filter_str = text.trim_start_matches("/history").trim();
+            let filter_str = filter_str.split('@').next().unwrap_or(filter_str).trim();
+            handle_history_cmd(&bot, &msg, &state, filter_str).await?;
             Ok(())
         }
         "/search" => {
@@ -307,10 +317,28 @@ async fn process_message(bot: Bot, msg: Message, state: AppState) -> ResponseRes
                 .await?;
                 return Ok(());
             }
-            handle_search_cmd(&bot, &msg, &state, text).await?;
+            let clean_query = extract_search_query_from_text(text);
+            handle_search_cmd(&bot, &msg, &state, &clean_query).await?;
             Ok(())
         }
     }
+}
+
+fn extract_search_query_from_text(text: &str) -> String {
+    let t = text.trim();
+    if t.contains("amazon.com") || t.contains("goodreads.com") || t.contains("openlibrary.org") {
+        if let Some(slug) = t.split('/').filter(|s| !s.is_empty()).last() {
+            let clean_slug = slug.split('?').next().unwrap_or(slug);
+            let words: Vec<&str> = clean_slug
+                .split(&['-', '_', '+'][..])
+                .filter(|w| w.len() > 2 && !w.chars().all(|c| c.is_numeric()))
+                .collect();
+            if !words.is_empty() {
+                return words.join(" ");
+            }
+        }
+    }
+    t.to_string()
 }
 
 /// Perform health check diagnostics (`/doctor` command) in parallel
@@ -396,94 +424,148 @@ async fn handle_doctor_cmd(bot: &Bot, msg: &Message, state: &AppState) -> Respon
     Ok(())
 }
 
-/// View download history (`/history` command) with re-send & Telegram client download buttons
-async fn handle_history_cmd(bot: &Bot, msg: &Message, state: &AppState) -> ResponseResult<()> {
+/// Render a single, paged history carousel message with 5 items per page & re-send buttons
+fn render_history_results_page(
+    records: &[crate::db::DownloadRecord],
+    filter_query: &str,
+    page: usize,
+    per_page: usize,
+) -> (String, InlineKeyboardMarkup) {
+    let filtered_records: Vec<&crate::db::DownloadRecord> = if filter_query.trim().is_empty() {
+        records.iter().collect()
+    } else {
+        let q = filter_query.to_lowercase();
+        records
+            .iter()
+            .filter(|r| {
+                r.book_title.to_lowercase().contains(&q)
+                    || r.book_author.as_deref().unwrap_or("").to_lowercase().contains(&q)
+                    || r.extension.as_deref().unwrap_or("").to_lowercase().contains(&q)
+            })
+            .collect()
+    };
+
+    let total_items = filtered_records.len();
+    if total_items == 0 {
+        let empty_text = if filter_query.is_empty() {
+            "📜 <b>Your Download History</b> is empty.".to_string()
+        } else {
+            format!("🔍 No download history records matching <code>{}</code>.", html_escape(filter_query))
+        };
+        return (empty_text, InlineKeyboardMarkup::default());
+    }
+
+    let total_pages = (total_items + per_page - 1) / per_page;
+    let current_page = page.min(total_pages).max(1);
+
+    let start_idx = (current_page - 1) * per_page;
+    let end_idx = (start_idx + per_page).min(total_items);
+    let page_items = &filtered_records[start_idx..end_idx];
+
+    let mut text = if filter_query.is_empty() {
+        format!("📜 <b>Download History</b> (Page {} of {} • {} Total)\n\n", current_page, total_pages, total_items)
+    } else {
+        format!("🔍 <b>History Search for \"{}\"</b> (Page {} of {} • {} Total)\n\n", html_escape(filter_query), current_page, total_pages, total_items)
+    };
+
+    let mut action_rows = Vec::new();
+
+    for (i, r) in page_items.iter().enumerate() {
+        let num = start_idx + i + 1;
+        let clean_title = clean_book_title(&r.book_title);
+        let author = r.book_author.as_deref().unwrap_or("Unknown Author");
+        let ext = r.extension.as_deref().unwrap_or("epub").to_uppercase();
+
+        text.push_str(&format!(
+            "<b>{}️⃣ {}</b>\n👤 <i>{}</i> • 📁 <code>{}</code>\n\n",
+            num,
+            html_escape(&clean_title),
+            html_escape(author),
+            ext
+        ));
+
+        let email_data = format!("resend_email_{}", r.id);
+        let tg_data = format!("resend_tg_{}", r.id);
+
+        action_rows.push(vec![
+            InlineKeyboardButton::callback(format!("📧 Re-send #{:.3} Email", num), email_data),
+            InlineKeyboardButton::callback(format!("💬 Re-send #{:.3} TG", num), tg_data),
+        ]);
+    }
+
+    // Row for Pagination: [ ⬅️ Prev ] [ Page 1/3 ] [ Next ➡️ ]
+    let mut nav_row = Vec::new();
+    if current_page > 1 {
+        nav_row.push(InlineKeyboardButton::callback(
+            "⬅️ Prev",
+            format!("hpage_{}", current_page - 1),
+        ));
+    }
+
+    if total_pages > 1 {
+        nav_row.push(InlineKeyboardButton::callback(
+            format!("Page {}/{}", current_page, total_pages),
+            "noop",
+        ));
+    }
+
+    if current_page < total_pages {
+        nav_row.push(InlineKeyboardButton::callback(
+            "Next ➡️",
+            format!("hpage_{}", current_page + 1),
+        ));
+    }
+
+    if !nav_row.is_empty() {
+        action_rows.push(nav_row);
+    }
+
+    (text, InlineKeyboardMarkup::new(action_rows))
+}
+
+/// View download history (`/history` command) with re-send & search filter
+async fn handle_history_cmd(
+    bot: &Bot,
+    msg: &Message,
+    state: &AppState,
+    filter_query: &str,
+) -> ResponseResult<()> {
     let user_obj = msg.from.as_ref().unwrap();
     let user_id = user_obj.id.0 as i64;
 
     info!("Retrieving download history for Telegram user {}", user_id);
 
-    match state.db.get_user_history(user_id, 10) {
+    match state.db.get_user_history(user_id, 200) {
         Ok(records) => {
-            if records.is_empty() {
-                bot.send_message(msg.chat.id, "📜 <b>No download history found for your account.</b>")
-                    .parse_mode(ParseMode::Html)
-                    .send()
-                    .await?;
-                return Ok(());
-            }
+            state
+                .history_cache
+                .lock()
+                .await
+                .insert(user_id, (filter_query.to_string(), records.clone()));
 
+            let (history_text, keyboard) = render_history_results_page(&records, filter_query, 1, 5);
+            bot.send_message(msg.chat.id, history_text)
+                .parse_mode(ParseMode::Html)
+                .reply_markup(keyboard)
+                .send()
+                .await?;
+        }
+        Err(err) => {
+            error!("Failed to fetch user history: {}", err);
             bot.send_message(
                 msg.chat.id,
-                format!("📜 <b>Your Recent Download History (Latest {}):</b>", records.len()),
+                format!("❌ Failed to retrieve history: {}", html_escape(&err.to_string())),
             )
             .parse_mode(ParseMode::Html)
             .send()
             .await?;
-
-            for (idx, r) in records.iter().enumerate() {
-                let ext = r.extension.as_deref().unwrap_or("N/A").to_uppercase();
-                let author = r.book_author.as_deref().unwrap_or("Unknown Author");
-                let size_str = if let Some(bytes) = r.filesize {
-                    format!("{:.2} MB", bytes as f64 / 1_048_576.0)
-                } else {
-                    "N/A".to_string()
-                };
-
-                let email_status = if r.sent_via_email { "📧 Sent" } else { "⚠️ Not Sent / Failed" };
-
-                let item_text = format!(
-                    "{}. 📖 <b>{}</b>\n\n\
-                    👤 <b>Author:</b> {}\n\
-                    📅 <b>Date:</b> <code>{}</code>\n\
-                    📁 <b>Format:</b> {} ({}) | {}\n\
-                    💾 <b>Local Path:</b> <code>{}</code>",
-                    idx + 1,
-                    html_escape(&r.book_title),
-                    html_escape(author),
-                    r.downloaded_at,
-                    ext,
-                    size_str,
-                    email_status,
-                    html_escape(&r.local_path)
-                );
-
-                let email_data = format!("resend_email_{}", r.id);
-                let custom_email_data = format!("resend_custom_{}", r.id);
-                let tg_data = format!("resend_tg_{}", r.id);
-                let del_data = format!("delete_hist_{}", r.id);
-
-                let keyboard = InlineKeyboardMarkup::new(vec![
-                    vec![
-                        InlineKeyboardButton::callback("📧 Re-send Email", email_data),
-                        InlineKeyboardButton::callback("💬 Send to Telegram", tg_data),
-                    ],
-                    vec![
-                        InlineKeyboardButton::callback("✉️ Custom Email", custom_email_data),
-                        InlineKeyboardButton::callback("🗑️ Delete Record", del_data),
-                    ],
-                ]);
-
-                bot.send_message(msg.chat.id, item_text)
-                    .parse_mode(ParseMode::Html)
-                    .reply_markup(keyboard)
-                    .send()
-                    .await?;
-            }
-        }
-        Err(err) => {
-            error!("Failed to fetch user history: {}", err);
-            bot.send_message(msg.chat.id, format!("❌ Failed to retrieve history: {}", html_escape(&err.to_string())))
-                .parse_mode(ParseMode::Html)
-                .send()
-                .await?;
         }
     }
 
     Ok(())
 }
 
-/// Render a single, compact, paged carousel message with 3 books per page & inline action buttons
+/// Render a single, compact, paged carousel message with 5 books per page (up to 5 pages) & inline action buttons
 fn render_search_results_page(
     query: &str,
     books: &[Book],
@@ -491,7 +573,7 @@ fn render_search_results_page(
     per_page: usize,
 ) -> (String, InlineKeyboardMarkup) {
     let total_books = books.len();
-    let total_pages = (total_books + per_page - 1) / per_page;
+    let total_pages = ((total_books + per_page - 1) / per_page).min(5);
     let current_page = page.min(total_pages).max(1);
 
     let start_idx = (current_page - 1) * per_page;
@@ -526,39 +608,41 @@ fn render_search_results_page(
 
         let email_data = format!("dl_email_{}_{}", book.id, hash);
         let tg_data = format!("dl_tg_{}_{}", book.id, hash);
+        let info_data = format!("info_{}_{}", book.id, hash);
 
         action_rows.push(vec![
-            InlineKeyboardButton::callback(format!("📧 Send #{:.3} to Kindle", num), email_data),
-            InlineKeyboardButton::callback(format!("💬 Download #{:.3} to Telegram", num), tg_data),
+            InlineKeyboardButton::callback(format!("📧 Kindle #{:.3}", num), email_data),
+            InlineKeyboardButton::callback(format!("💬 TG #{:.3}", num), tg_data),
+            InlineKeyboardButton::callback(format!("ℹ️ #{:.3}", num), info_data),
         ]);
     }
 
-    // Row for Pagination: [ ⬅️ Prev ] [ 1/3 ] [ Next ➡️ ]
+    // Row for Pagination: [ ⬅️ Prev ] [ Page 1/3 ] [ Next ➡️ ]
     let mut nav_row = Vec::new();
     if current_page > 1 {
         nav_row.push(InlineKeyboardButton::callback(
             "⬅️ Prev",
             format!("spage_{}", current_page - 1),
         ));
-    } else {
-        nav_row.push(InlineKeyboardButton::callback(" ⛔ ", "noop"));
     }
 
-    nav_row.push(InlineKeyboardButton::callback(
-        format!("{}/{}", current_page, total_pages),
-        "noop",
-    ));
+    if total_pages > 1 {
+        nav_row.push(InlineKeyboardButton::callback(
+            format!("Page {}/{}", current_page, total_pages),
+            "noop",
+        ));
+    }
 
     if current_page < total_pages {
         nav_row.push(InlineKeyboardButton::callback(
             "Next ➡️",
             format!("spage_{}", current_page + 1),
         ));
-    } else {
-        nav_row.push(InlineKeyboardButton::callback(" ⛔ ", "noop"));
     }
 
-    action_rows.push(nav_row);
+    if !nav_row.is_empty() {
+        action_rows.push(nav_row);
+    }
 
     (text, InlineKeyboardMarkup::new(action_rows))
 }
@@ -597,7 +681,7 @@ async fn execute_search(bot: &Bot, chat_id: ChatId, state: &AppState, query: &st
             let target_user_id = searching_msg.chat.id.0;
             state.search_cache.lock().await.insert(target_user_id, (query.to_string(), books.clone()));
 
-            let (page_text, keyboard) = render_search_results_page(query, &books, 1, 3);
+            let (page_text, keyboard) = render_search_results_page(query, &books, 1, 5);
 
             bot.edit_message_text(chat_id, searching_msg.id, page_text)
                 .parse_mode(ParseMode::Html)
@@ -691,7 +775,7 @@ async fn process_callback(bot: Bot, q: CallbackQuery, state: AppState) -> Respon
         let target_page: usize = data.trim_start_matches("spage_").parse().unwrap_or(1);
         let cache = state.search_cache.lock().await;
         if let Some((ref query, ref books)) = cache.get(&user_id) {
-            let (text, keyboard) = render_search_results_page(query, books, target_page, 3);
+            let (text, keyboard) = render_search_results_page(query, books, target_page, 5);
             if let Some(ref m) = q.message {
                 bot.edit_message_text(chat_id, m.id(), text)
                     .parse_mode(ParseMode::Html)
@@ -701,6 +785,82 @@ async fn process_callback(bot: Bot, q: CallbackQuery, state: AppState) -> Respon
             }
         }
         bot.answer_callback_query(&q.id).send().await?;
+        return Ok(());
+    }
+
+    // Case 000: History Pagination Callback (hpage_<page_num>)
+    if data.starts_with("hpage_") {
+        let target_page: usize = data.trim_start_matches("hpage_").parse().unwrap_or(1);
+        let cache = state.history_cache.lock().await;
+        if let Some((ref filter_q, ref records)) = cache.get(&user_id) {
+            let (text, keyboard) = render_history_results_page(records, filter_q, target_page, 5);
+            if let Some(ref m) = q.message {
+                bot.edit_message_text(chat_id, m.id(), text)
+                    .parse_mode(ParseMode::Html)
+                    .reply_markup(keyboard)
+                    .send()
+                    .await?;
+            }
+        }
+        bot.answer_callback_query(&q.id).send().await?;
+        return Ok(());
+    }
+
+    // Case 0000: Book Details & Synopsis Callback (info_<book_id>_<hash>)
+    if data.starts_with("info_") {
+        let parts: Vec<&str> = data.trim_start_matches("info_").split('_').collect();
+        let book_id: u64 = parts.get(0).unwrap_or(&"0").parse().unwrap_or(0);
+        let hash = parts.get(1).unwrap_or(&"nohash");
+
+        bot.answer_callback_query(&q.id).text("⏳ Loading book details...").send().await?;
+
+        let client = state.client.lock().await.clone();
+        match client.get_download_info(book_id, hash).await {
+            Ok(info) => {
+                let clean_title = clean_book_title(&info.book.title);
+                let author = info.book.author.as_deref().unwrap_or("Unknown Author");
+                let publisher = info.book.publisher.as_deref().unwrap_or("Unknown Publisher");
+                let year = info.book.year.as_deref().unwrap_or("N/A");
+                let lang = info.book.language.as_deref().unwrap_or("N/A");
+                let ext = info.book.extension.as_deref().unwrap_or("epub").to_uppercase();
+                let size = info.book.filesize_string.as_deref().unwrap_or("N/A");
+                let desc = info.book.description.as_deref().unwrap_or("No detailed synopsis available.");
+
+                let details_text = format!(
+                    "📖 <b>{}</b>\n\n\
+                    👤 <b>Author:</b> {}\n\
+                    🏢 <b>Publisher:</b> {}\n\
+                    📅 <b>Year:</b> {} | 🌐 <b>Language:</b> {}\n\
+                    📁 <b>Format:</b> {} ({})\n\n\
+                    📝 <b>Synopsis / Summary:</b>\n<i>{}</i>",
+                    html_escape(&clean_title),
+                    html_escape(author),
+                    html_escape(publisher),
+                    html_escape(year),
+                    html_escape(lang),
+                    ext,
+                    size,
+                    html_escape(desc)
+                );
+
+                let email_data = format!("dl_email_{}_{}", book_id, hash);
+                let tg_data = format!("dl_tg_{}_{}", book_id, hash);
+
+                let keyboard = InlineKeyboardMarkup::new(vec![vec![
+                    InlineKeyboardButton::callback("📧 Send to Kindle", email_data),
+                    InlineKeyboardButton::callback("💬 Download to Telegram", tg_data),
+                ]]);
+
+                bot.send_message(chat_id, details_text)
+                    .parse_mode(ParseMode::Html)
+                    .reply_markup(keyboard)
+                    .send()
+                    .await?;
+            }
+            Err(e) => {
+                bot.send_message(chat_id, format!("❌ Could not load details: {}", html_escape(&e.to_string()))).parse_mode(ParseMode::Html).send().await?;
+            }
+        }
         return Ok(());
     }
 
@@ -775,6 +935,16 @@ async fn process_callback(bot: Bot, q: CallbackQuery, state: AppState) -> Respon
             _ => "✅ Preference updated: Ask Every Time",
         };
         bot.answer_callback_query(&q.id).text(status_text).send().await?;
+        bot.send_message(chat_id, status_text).send().await?;
+        return Ok(());
+    }
+
+    // Case 0c: Preferred Format Setting
+    if data.starts_with("set_fmt_") {
+        let fmt = data.trim_start_matches("set_fmt_");
+        let _ = state.db.set_preferred_format(user_id, fmt);
+        let status_text = format!("✅ Preferred book format updated to: {}", fmt.to_uppercase());
+        bot.answer_callback_query(&q.id).text(&status_text).send().await?;
         bot.send_message(chat_id, status_text).send().await?;
         return Ok(());
     }

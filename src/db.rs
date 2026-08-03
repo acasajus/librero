@@ -261,6 +261,23 @@ impl Database {
         Ok(())
     }
 
+    /// Set user preferred format ('epub', 'pdf', 'mobi', 'any')
+    pub fn set_preferred_format(&self, telegram_user_id: i64, format: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO user_settings (telegram_user_id, preferred_format) VALUES (?1, ?2)
+             ON CONFLICT(telegram_user_id) DO UPDATE SET preferred_format = excluded.preferred_format",
+            params![telegram_user_id, format],
+        )?;
+        Ok(())
+    }
+
+    /// Get user preferred format
+    pub fn get_preferred_format(&self, telegram_user_id: i64) -> String {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT preferred_format FROM user_settings WHERE telegram_user_id = ?1").ok().unwrap();
+        stmt.query_row(params![telegram_user_id], |row| row.get(0)).unwrap_or_else(|_| "epub".to_string())
+    }
 }
 
 #[cfg(test)]

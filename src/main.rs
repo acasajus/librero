@@ -82,6 +82,7 @@ async fn main() -> Result<()> {
         email,
         pending_custom_emails: Arc::new(Mutex::new(std::collections::HashMap::new())),
         search_cache: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        history_cache: Arc::new(Mutex::new(std::collections::HashMap::new())),
     };
 
     // 6. Spawn Background Z-Library Auto-Login Task (Concurrently with Telegram Bot Startup)
@@ -159,12 +160,14 @@ async fn main() -> Result<()> {
     if state.config.dashboard.enabled {
         let db_clone = state.db.clone();
         let cfg_clone = state.config.clone();
+        let client_clone = state.client.clone();
+        let email_clone = state.email.clone();
         let host = state.config.dashboard.host.clone();
         let port = cli.dashboard_port.unwrap_or(state.config.dashboard.port);
         let server_name = state.config.dashboard.server_name.clone();
 
         tokio::spawn(async move {
-            if let Err(e) = start_dashboard_server(db_clone, cfg_clone, &host, port, &server_name).await {
+            if let Err(e) = start_dashboard_server(db_clone, cfg_clone, client_clone, email_clone, &host, port, &server_name).await {
                 warn!("Admin Web Dashboard task exited with error: {}", e);
             }
         });
