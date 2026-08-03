@@ -1,5 +1,5 @@
 use crate::models::{
-    Book, LoginResponseData, SearchQuery, SessionTokens, UserProfile,
+    clean_book_title, Book, LoginResponseData, SearchQuery, SessionTokens, UserProfile,
 };
 use crate::tor::TorConfig;
 use anyhow::{anyhow, Context, Result};
@@ -20,7 +20,7 @@ pub struct DownloadInfo {
 }
 
 /// Z-Library client over Tor network
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ZLibraryClient {
     pub config: TorConfig,
     client: Client,
@@ -407,7 +407,7 @@ impl ZLibraryClient {
                             }
                         }
 
-                        let final_title = title.unwrap_or_else(|| format!("Book {}", book_id));
+                        let final_title = clean_book_title(&title.unwrap_or_else(|| format!("Book {}", book_id)));
 
                         let book_metadata = Book {
                             id: book_id,

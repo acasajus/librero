@@ -1,6 +1,9 @@
 use anyhow::Result;
 use clap::Parser;
-use librero::{start_bot, AppState, Config, Database, EmailSender, TorConfig, TorMode, ZLibraryClient};
+use librero::{
+    start_bot, start_calibre_server, start_dashboard_server, AppState, Config, Database,
+    EmailSender, TorConfig, TorMode, ZLibraryClient,
+};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::fs;
@@ -23,6 +26,14 @@ struct Cli {
     /// Override Tor SOCKS5 proxy URL
     #[arg(short, long)]
     proxy: Option<String>,
+
+    /// Override Calibre Content Server port (defaults to 8080 or config.toml [calibre] port)
+    #[arg(short = 'P', long = "calibre-port")]
+    calibre_port: Option<u16>,
+
+    /// Override Admin Web Dashboard port (defaults to 8081 or config.toml [dashboard] port)
+    #[arg(short = 'D', long = "dashboard-port")]
+    dashboard_port: Option<u16>,
 }
 
 #[tokio::main]
@@ -69,6 +80,7 @@ async fn main() -> Result<()> {
         client: Arc::new(Mutex::new(client)),
         db,
         email,
+        pending_custom_emails: Arc::new(Mutex::new(std::collections::HashMap::new())),
     };
 
     // 6. Spawn Background Z-Library Auto-Login Task (Concurrently with Telegram Bot Startup)
@@ -90,9 +102,78 @@ async fn main() -> Result<()> {
         }
     });
 
-    // 7. Start Telegram Bot Listener Daemon Immediately
+    // 7. Spawn Tor Keep-Alive Background Task with Random Jitter (600 ± 300 seconds -> 300s to 900s)
+    let keepalive_state = state.clone();
+    tokio::spawn(async move {
+        use rand::Rng;
+        loop {
+            let jitter_secs = rand::thread_rng().gen_range(300..=900);
+            info!("Tor keep-alive next health check scheduled in {} seconds (jitter: 600 ± 300s)", jitter_secs);
+            tokio::time::sleep(std::time::Duration::from_secs(jitter_secs)).await;
+
+            info!("Running Tor connection keep-alive check...");
+
+            let client = keepalive_state.client.lock().await.clone();
+            match client.get_profile().await {
+                Ok(profile) => {
+                    info!(
+                        "Tor keep-alive check successful! Active profile: '{:?}', Downloads today: {}/{}",
+                        profile.name,
+                        profile.downloads_today.unwrap_or(0),
+                        profile.downloads_limit.unwrap_or(0)
+                    );
+                }
+                Err(err) => {
+                    warn!("Tor keep-alive check warning: {}. Attempting re-authentication...", err);
+                    if let (Some(ref email_str), Some(ref pass_str)) = (&keepalive_state.config.auth.email, &keepalive_state.config.auth.password) {
+                        if !email_str.is_empty() && !pass_str.is_empty() {
+                            let mut client_mut = keepalive_state.client.lock().await;
+                            if let Err(login_err) = client_mut.login(email_str, pass_str).await {
+                                warn!("Tor keep-alive re-login failed: {}", login_err);
+                            } else {
+                                info!("Tor keep-alive re-login succeeded!");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    // 8. Spawn Calibre Content Server HTTP Task (if enabled)
+    if state.config.calibre.enabled {
+        let db_clone = state.db.clone();
+        let host = state.config.calibre.host.clone();
+        let port = cli.calibre_port.unwrap_or(state.config.calibre.port);
+        let server_name = state.config.calibre.server_name.clone();
+
+        tokio::spawn(async move {
+            if let Err(e) = start_calibre_server(db_clone, &host, port, &server_name).await {
+                warn!("Calibre Content Server task exited with error: {}", e);
+            }
+        });
+    }
+
+    // 9. Spawn Admin Web Dashboard HTTP Task (if enabled)
+    if state.config.dashboard.enabled {
+        let db_clone = state.db.clone();
+        let cfg_clone = state.config.clone();
+        let host = state.config.dashboard.host.clone();
+        let port = cli.dashboard_port.unwrap_or(state.config.dashboard.port);
+        let server_name = state.config.dashboard.server_name.clone();
+
+        tokio::spawn(async move {
+            if let Err(e) = start_dashboard_server(db_clone, cfg_clone, &host, port, &server_name).await {
+                warn!("Admin Web Dashboard task exited with error: {}", e);
+            }
+        });
+    }
+
+    // 10. Start Telegram Bot Listener Daemon Immediately
     info!("Librero Daemon is active. Telegram Bot is online and listening for orders.");
     start_bot(state).await?;
 
     Ok(())
 }
+
+

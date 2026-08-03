@@ -1,8 +1,67 @@
 use serde::{Deserialize, Serialize};
 
+/// Clean book titles by removing Z-Library domain watermarks (e.g. '(z-library.sk, 1lib.sk, z-lib.sk)'),
+/// stripping dangling unclosed parentheses/brackets, and trimming trailing truncation symbols.
+pub fn clean_book_title(raw_title: &str) -> String {
+    let mut title = raw_title.trim().to_string();
+
+    // 1. Remove parenthetical domain watermarks e.g. (z-library.sk, 1lib.sk, z-lib.sk) or [z-lib.org]
+    while let Some(open_paren) = title.rfind('(').or_else(|| title.rfind('[')) {
+        let suffix = &title[open_paren..];
+        let suffix_lower = suffix.to_lowercase();
+        if suffix_lower.contains("z-lib")
+            || suffix_lower.contains("1lib")
+            || suffix_lower.contains("b-ok")
+            || suffix_lower.contains("libgen")
+            || suffix_lower.contains(".sk")
+            || suffix_lower.contains(".se")
+            || suffix_lower.contains(".is")
+            || suffix_lower.contains(".org")
+            || suffix_lower.contains(".cc")
+            || suffix_lower.contains(".gs")
+            || suffix_lower.contains(".rs")
+            || suffix_lower.contains(".site")
+            || suffix_lower.contains(".to")
+        {
+            title = title[..open_paren].trim().to_string();
+        } else {
+            break;
+        }
+    }
+
+    // 2. Remove dangling / unclosed '(' or '[' at the end of the title (e.g. 'The Stars My Destination (A')
+    while let Some(open_idx) = title.rfind(|c| c == '(' || c == '[') {
+        let open_char = title.as_bytes()[open_idx] as char;
+        let close_char = if open_char == '(' { ')' } else { ']' };
+        let rest = &title[open_idx..];
+        if !rest.contains(close_char) {
+            title = title[..open_idx].trim().to_string();
+        } else {
+            break;
+        }
+    }
+
+    // 3. Trim trailing truncation markers like '_', '...', '-', or extra punctuation left at the end
+    loop {
+        let len_before = title.len();
+        title = title.trim_end_matches(|c: char| c == '_' || c == '.' || c == '-' || c.is_whitespace()).to_string();
+        if title.len() == len_before {
+            break;
+        }
+    }
+
+    if title.is_empty() {
+        raw_title.trim().to_string()
+    } else {
+        title
+    }
+}
+
+
 /// Represents the Z-Library credentials for authentication.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Credentials {
+
     pub email: String,
     pub password: String,
 }
@@ -85,7 +144,7 @@ impl Book {
         })?;
 
         // Parse Title: string or printable number
-        let title = obj.get("title").and_then(|v| {
+        let raw_title = obj.get("title").and_then(|v| {
             if let Some(s) = v.as_str() {
                 Some(s.to_string())
             } else if v.is_number() {
@@ -94,6 +153,9 @@ impl Book {
                 None
             }
         }).unwrap_or_else(|| format!("Book {}", id));
+
+        let title = clean_book_title(&raw_title);
+
 
         let author = obj.get("author").and_then(|v| v.as_str().map(|s| s.to_string()));
         let publisher = obj.get("publisher").and_then(|v| v.as_str().map(|s| s.to_string()));
@@ -227,4 +289,30 @@ mod tests {
         assert_eq!(book.extension.as_deref(), Some("epub"));
         assert_eq!(book.hash.as_deref(), Some("a1b2c3d4e5f6"));
     }
+
+    #[test]
+    fn test_clean_book_title() {
+        assert_eq!(
+            clean_book_title("The Stars My Destination (A (z-library.sk, 1lib.sk, z-lib.sk)"),
+            "The Stars My Destination"
+        );
+        assert_eq!(
+            clean_book_title("There Is No Antimemetics Di_ (z-library.sk, 1lib.sk, z-lib.sk)"),
+            "There Is No Antimemetics Di"
+        );
+        assert_eq!(
+            clean_book_title("Rust Programming in Action (z-lib.is)"),
+            "Rust Programming in Action"
+        );
+        assert_eq!(
+            clean_book_title("Clean Code [z-lib.org]"),
+            "Clean Code"
+        );
+        assert_eq!(
+            clean_book_title("Normal Title"),
+            "Normal Title"
+        );
+    }
 }
+
+

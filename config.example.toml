@@ -45,3 +45,19 @@ fallback_onion_addresses = [
 ]
 
 connect_timeout_seconds = 45
+
+[calibre]
+# Calibre Content Server & OPDS e-Reader Catalog HTTP Service Settings
+enabled = true
+host = "0.0.0.0"
+port = 8080
+server_name = "Librero Calibre Content Server"
+
+[dashboard]
+# Admin Web Dashboard displaying download history, user attribution, and local file downloads
+enabled = true
+host = "0.0.0.0"
+port = 8081
+server_name = "Librero Download History & Admin Dashboard"
+
+

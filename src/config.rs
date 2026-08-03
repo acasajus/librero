@@ -103,6 +103,46 @@ impl Default for TorSettings {
     }
 }
 
+/// Calibre Content Server settings in config.toml
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CalibreSettings {
+    pub enabled: bool,
+    pub host: String,
+    pub port: u16,
+    pub server_name: String,
+}
+
+impl Default for CalibreSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            host: "0.0.0.0".to_string(),
+            port: 8080,
+            server_name: "Librero Calibre Content Server".to_string(),
+        }
+    }
+}
+
+/// Admin Web Dashboard settings in config.toml
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DashboardSettings {
+    pub enabled: bool,
+    pub host: String,
+    pub port: u16,
+    pub server_name: String,
+}
+
+impl Default for DashboardSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            host: "0.0.0.0".to_string(),
+            port: 8081,
+            server_name: "Librero Download History & Admin Dashboard".to_string(),
+        }
+    }
+}
+
 /// Top-level configuration object stored in config.toml
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
@@ -111,6 +151,10 @@ pub struct Config {
     pub telegram: TelegramSettings,
     pub smtp: SmtpSettings,
     pub storage: StorageSettings,
+    #[serde(default)]
+    pub calibre: CalibreSettings,
+    #[serde(default)]
+    pub dashboard: DashboardSettings,
 }
 
 impl Config {

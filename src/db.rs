@@ -1,4 +1,4 @@
-use crate::models::Book;
+use crate::models::{clean_book_title, Book};
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
 use std::sync::{Arc, Mutex};
@@ -105,7 +105,7 @@ impl Database {
                 telegram_user_id: row.get(1)?,
                 user_email: row.get(2)?,
                 book_id: row.get(3)?,
-                book_title: row.get(4)?,
+                book_title: clean_book_title(&row.get::<_, String>(4)?),
                 book_author: row.get(5)?,
                 extension: row.get(6)?,
                 filesize: row.get(7)?,
@@ -145,7 +145,7 @@ impl Database {
                 telegram_user_id: row.get(1)?,
                 user_email: row.get(2)?,
                 book_id: row.get(3)?,
-                book_title: row.get(4)?,
+                book_title: clean_book_title(&row.get::<_, String>(4)?),
                 book_author: row.get(5)?,
                 extension: row.get(6)?,
                 filesize: row.get(7)?,
@@ -162,10 +162,97 @@ impl Database {
         Ok(records)
     }
 
+    /// Query all download records in library across all users (for Calibre Content Server)
+    pub fn get_all_downloads(&self, limit: usize) -> Result<Vec<DownloadRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, telegram_user_id, user_email, book_id, book_title, book_author, extension, filesize, local_path, sent_via_email, downloaded_at
+             FROM downloads
+             ORDER BY id DESC
+             LIMIT ?1",
+        )?;
+
+        let history_iter = stmt.query_map(params![limit as i64], |row| {
+            Ok(DownloadRecord {
+                id: row.get(0)?,
+                telegram_user_id: row.get(1)?,
+                user_email: row.get(2)?,
+                book_id: row.get(3)?,
+                book_title: clean_book_title(&row.get::<_, String>(4)?),
+                book_author: row.get(5)?,
+                extension: row.get(6)?,
+                filesize: row.get(7)?,
+                local_path: row.get(8)?,
+                sent_via_email: row.get(9)?,
+                downloaded_at: row.get(10)?,
+            })
+        })?;
+
+        let mut records = Vec::new();
+        for record in history_iter {
+            records.push(record?);
+        }
+        Ok(records)
+    }
+
+
     /// Query total download count for health check
     pub fn get_total_downloads(&self) -> Result<u64> {
         let conn = self.conn.lock().unwrap();
         let count: u64 = conn.query_row("SELECT COUNT(*) FROM downloads", [], |row| row.get(0))?;
         Ok(count)
     }
+
+    /// Delete a download record by ID and Telegram User ID (ensuring ownership)
+    pub fn delete_record(&self, id: i64, telegram_user_id: i64) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let rows = conn.execute(
+            "DELETE FROM downloads WHERE id = ?1 AND telegram_user_id = ?2",
+            params![id, telegram_user_id],
+        )?;
+        Ok(rows > 0)
+    }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_db_delete_record() {
+        let db = Database::new(":memory:").unwrap();
+        let book = Book {
+            id: 101,
+            title: "Test Book".into(),
+            author: Some("Author".into()),
+            publisher: None,
+            year: None,
+            language: None,
+            extension: Some("epub".into()),
+            filesize: Some(500),
+            filesize_string: None,
+            cover: None,
+            hash: None,
+            description: None,
+            rating: None,
+            quality: None,
+            download_url: None,
+        };
+
+
+        db.record_download(12345, "user@test.com", &book, "/tmp/test.epub", true).unwrap();
+        let history = db.get_user_history(12345, 10).unwrap();
+        assert_eq!(history.len(), 1);
+        let id = history[0].id;
+
+        // Try deleting with wrong user ID
+        assert_eq!(db.delete_record(id, 99999).unwrap(), false);
+        assert_eq!(db.get_user_history(12345, 10).unwrap().len(), 1);
+
+        // Delete with correct user ID
+        assert_eq!(db.delete_record(id, 12345).unwrap(), true);
+        assert_eq!(db.get_user_history(12345, 10).unwrap().len(), 0);
+    }
+}
+
+

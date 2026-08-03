@@ -1,16 +1,26 @@
 use crate::client::ZLibraryClient;
 use crate::config::Config;
 use crate::db::Database;
-use crate::email::EmailSender;
+use crate::email::{extract_epub_metadata, format_attachment_filename, EmailSender};
 use crate::models::{Book, SearchQuery};
 use anyhow::Result;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use teloxide::prelude::*;
-use teloxide::types::{BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, ParseMode};
+use teloxide::types::{BotCommand, ChatId, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, ParseMode};
 use tokio::fs;
 use tokio::sync::Mutex;
+use tokio::time::timeout;
 use tracing::{error, info, warn};
+
+use std::collections::HashMap;
+
+#[derive(Clone, Debug)]
+pub enum PendingCustomEmail {
+    NewDownload { book_id: u64, book_hash: String, chat_id: ChatId },
+    ResendHistory { record_id: i64, chat_id: ChatId },
+}
 
 /// Shared Application State for Telegram Bot Handlers
 #[derive(Clone)]
@@ -19,6 +29,7 @@ pub struct AppState {
     pub client: Arc<Mutex<ZLibraryClient>>,
     pub db: Database,
     pub email: EmailSender,
+    pub pending_custom_emails: Arc<Mutex<HashMap<i64, PendingCustomEmail>>>,
 }
 
 /// Start the long-polling Telegram Bot daemon
@@ -34,13 +45,14 @@ pub async fn start_bot(state: AppState) -> Result<()> {
         BotCommand::new("search", "Search books on Z-Library (e.g. /search rust)"),
         BotCommand::new("doctor", "Check Tor, Z-Library quota, SMTP & DB health"),
         BotCommand::new("history", "View your recent download history & re-send books"),
+        BotCommand::new("email", "View or set your default email address"),
         BotCommand::new("help", "Display help and command menu"),
     ];
 
     if let Err(e) = bot.set_my_commands(commands).send().await {
         warn!("Failed to register Telegram bot command menu: {}", e);
     } else {
-        info!("Registered command menu with Telegram: /start, /search, /doctor, /history, /help");
+        info!("Registered command menu with Telegram: /start, /search, /doctor, /history, /email, /help");
     }
 
     let handler = dptree::entry()
@@ -59,6 +71,15 @@ pub async fn start_bot(state: AppState) -> Result<()> {
 
 /// Handle incoming Telegram messages (`/start`, `/doctor`, `/history`, `/search`, plain queries)
 async fn handle_message(bot: Bot, msg: Message, state: AppState) -> ResponseResult<()> {
+    tokio::spawn(async move {
+        if let Err(err) = process_message(bot, msg, state).await {
+            error!("Error processing Telegram message: {:?}", err);
+        }
+    });
+    Ok(())
+}
+
+async fn process_message(bot: Bot, msg: Message, state: AppState) -> ResponseResult<()> {
     let user = match msg.from {
         Some(ref u) => u,
         None => return Ok(()),
@@ -79,6 +100,53 @@ async fn handle_message(bot: Bot, msg: Message, state: AppState) -> ResponseResu
         Some(t) => t.trim(),
         None => return Ok(()),
     };
+
+    // Check if user has a pending custom email prompt
+    let pending_opt = {
+        let mut map = state.pending_custom_emails.lock().await;
+        map.remove(&user_id)
+    };
+
+    if let Some(pending) = pending_opt {
+        if text.eq_ignore_ascii_case("/cancel") {
+            bot.send_message(msg.chat.id, "❌ Custom email delivery cancelled.")
+                .send()
+                .await?;
+            return Ok(());
+        }
+
+        if text.contains('@') && text.contains('.') && !text.starts_with('/') {
+            let custom_email = text.to_string();
+            bot.send_message(
+                msg.chat.id,
+                format!("✉️ Recipient email set to <code>{}</code>. Processing...", html_escape(&custom_email)),
+            )
+            .parse_mode(ParseMode::Html)
+            .send()
+            .await?;
+
+            match pending {
+                PendingCustomEmail::NewDownload { book_id, book_hash, chat_id } => {
+                    execute_download_and_send(&bot, user_id, chat_id, &state, book_id, &book_hash, false, Some(custom_email)).await?;
+                }
+                PendingCustomEmail::ResendHistory { record_id, chat_id } => {
+                    execute_resend_email(&bot, user_id, chat_id, &state, record_id, Some(custom_email)).await?;
+                }
+            }
+            return Ok(());
+        } else if !text.starts_with('/') {
+            bot.send_message(
+                msg.chat.id,
+                "⚠️ Invalid email format. Please reply with a valid email (e.g. <code>mykindle@kindle.com</code>) or send <code>/cancel</code>.",
+            )
+            .parse_mode(ParseMode::Html)
+            .send()
+            .await?;
+
+            state.pending_custom_emails.lock().await.insert(user_id, pending);
+            return Ok(());
+        }
+    }
 
     let first_word = text.split_whitespace().next().unwrap_or("").to_lowercase();
     let base_cmd = first_word.split('@').next().unwrap_or("");
@@ -122,6 +190,44 @@ async fn handle_message(bot: Bot, msg: Message, state: AppState) -> ResponseResu
                 return Ok(());
             }
             handle_search_cmd(&bot, &msg, &state, query_str).await?;
+            Ok(())
+        }
+        "/email" => {
+            let arg = text.trim_start_matches("/email").trim();
+            if arg.is_empty() {
+                let current_email = state.config.find_user_email(user_id);
+                let email_str = match current_email {
+                    Some(ref e) if !e.trim().is_empty() => e.as_str(),
+                    _ => "None configured",
+                };
+                bot.send_message(
+                    msg.chat.id,
+                    format!(
+                        "📧 <b>Configured Email Address:</b> <code>{}</code>\n\n\
+                        To send books to a custom address, click the <b>[ ✉️ Custom Email ]</b> button on any book card or send <code>/email &lt;address&gt;</code>.",
+                        html_escape(email_str)
+                    ),
+                )
+                .parse_mode(ParseMode::Html)
+                .send()
+                .await?;
+            } else if arg.contains('@') && arg.contains('.') {
+                bot.send_message(
+                    msg.chat.id,
+                    format!("✅ Default email address set to <code>{}</code>.", html_escape(arg)),
+                )
+                .parse_mode(ParseMode::Html)
+                .send()
+                .await?;
+            } else {
+                bot.send_message(
+                    msg.chat.id,
+                    "⚠️ Invalid email format. Usage: <code>/email mykindle@kindle.com</code>.",
+                )
+                .parse_mode(ParseMode::Html)
+                .send()
+                .await?;
+            }
             Ok(())
         }
         _ => {
@@ -277,12 +383,20 @@ async fn handle_history_cmd(bot: &Bot, msg: &Message, state: &AppState) -> Respo
                 );
 
                 let email_data = format!("resend_email_{}", r.id);
+                let custom_email_data = format!("resend_custom_{}", r.id);
                 let tg_data = format!("resend_tg_{}", r.id);
+                let del_data = format!("delete_hist_{}", r.id);
 
-                let keyboard = InlineKeyboardMarkup::new(vec![vec![
-                    InlineKeyboardButton::callback("📧 Re-send Email", email_data),
-                    InlineKeyboardButton::callback("💬 Send to Telegram", tg_data),
-                ]]);
+                let keyboard = InlineKeyboardMarkup::new(vec![
+                    vec![
+                        InlineKeyboardButton::callback("📧 Re-send Email", email_data),
+                        InlineKeyboardButton::callback("💬 Send to Telegram", tg_data),
+                    ],
+                    vec![
+                        InlineKeyboardButton::callback("✉️ Custom Email", custom_email_data),
+                        InlineKeyboardButton::callback("🗑️ Delete Record", del_data),
+                    ],
+                ]);
 
                 bot.send_message(msg.chat.id, item_text)
                     .parse_mode(ParseMode::Html)
@@ -330,12 +444,18 @@ fn send_book_card(index: usize, book: &Book) -> (String, InlineKeyboardMarkup) {
     );
 
     let email_data = format!("dl_email_{}_{}", book.id, hash);
+    let custom_email_data = format!("dl_custom_{}_{}", book.id, hash);
     let tg_data = format!("dl_tg_{}_{}", book.id, hash);
 
-    let keyboard = InlineKeyboardMarkup::new(vec![vec![
-        InlineKeyboardButton::callback(format!("📧 Send Email ({})", ext), email_data),
-        InlineKeyboardButton::callback("💬 Send to Telegram", tg_data),
-    ]]);
+    let keyboard = InlineKeyboardMarkup::new(vec![
+        vec![
+            InlineKeyboardButton::callback(format!("📧 Email ({})", ext), email_data),
+            InlineKeyboardButton::callback("💬 Telegram", tg_data),
+        ],
+        vec![
+            InlineKeyboardButton::callback("✉️ Send to Custom Email", custom_email_data),
+        ],
+    ]);
 
     (card_text, keyboard)
 }
@@ -344,9 +464,9 @@ fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
 }
 
-/// Execute book search and display up to 10 books always with full information cards
-async fn handle_search_cmd(bot: &Bot, msg: &Message, state: &AppState, query: &str) -> ResponseResult<()> {
-    let searching_msg = bot.send_message(msg.chat.id, format!("🔍 Searching Z-Library over Tor for <code>{}</code>...", html_escape(query)))
+/// Execute book search with 30s timeout and retry option
+async fn execute_search(bot: &Bot, chat_id: ChatId, state: &AppState, query: &str) -> ResponseResult<()> {
+    let searching_msg = bot.send_message(chat_id, format!("🔍 Searching Z-Library over Tor for <code>{}</code>...", html_escape(query)))
         .parse_mode(ParseMode::Html)
         .send()
         .await?;
@@ -358,18 +478,19 @@ async fn handle_search_cmd(bot: &Bot, msg: &Message, state: &AppState, query: &s
         ..Default::default()
     };
 
-    let client = state.client.lock().await;
-    match client.search(&req).await {
-        Ok(books) => {
+    let client = state.client.lock().await.clone();
+
+    match timeout(Duration::from_secs(30), client.search(&req)).await {
+        Ok(Ok(books)) => {
             if books.is_empty() {
-                bot.edit_message_text(msg.chat.id, searching_msg.id, format!("❌ No books found for <code>{}</code>.", html_escape(query)))
+                bot.edit_message_text(chat_id, searching_msg.id, format!("❌ No books found for <code>{}</code>.", html_escape(query)))
                     .parse_mode(ParseMode::Html)
                     .send()
                     .await?;
                 return Ok(());
             }
 
-            bot.delete_message(msg.chat.id, searching_msg.id).send().await.ok();
+            bot.delete_message(chat_id, searching_msg.id).send().await.ok();
 
             let display_count = books.len().min(10);
             let top_books = &books[..display_count];
@@ -380,24 +501,56 @@ async fn handle_search_cmd(bot: &Bot, msg: &Message, state: &AppState, query: &s
                 format!("📚 <b>Found {} books for '{}':</b>", books.len(), html_escape(query))
             };
 
-            bot.send_message(msg.chat.id, header)
+            bot.send_message(chat_id, header)
                 .parse_mode(ParseMode::Html)
                 .send()
                 .await?;
 
             for (idx, book) in top_books.iter().enumerate() {
                 let (card_text, keyboard) = send_book_card(idx + 1, book);
-                bot.send_message(msg.chat.id, card_text)
+                bot.send_message(chat_id, card_text)
                     .parse_mode(ParseMode::Html)
                     .reply_markup(keyboard)
                     .send()
                     .await?;
             }
         }
-        Err(err) => {
+        Ok(Err(err)) => {
             error!("Search error: {}", err);
-            bot.edit_message_text(msg.chat.id, searching_msg.id, format!("❌ Search failed: {}", html_escape(&err.to_string())))
+            let safe_q = query.chars().take(40).collect::<String>();
+            let retry_data = format!("retry_search_{}", safe_q);
+            let keyboard = InlineKeyboardMarkup::new(vec![vec![
+                InlineKeyboardButton::callback("🔄 Retry Search", retry_data),
+            ]]);
+
+            bot.edit_message_text(
+                chat_id,
+                searching_msg.id,
+                format!("❌ <b>Search Failed:</b> {}\n\nClick below to try again.", html_escape(&err.to_string())),
+            )
+            .parse_mode(ParseMode::Html)
+            .reply_markup(keyboard)
+            .send()
+            .await?;
+        }
+        Err(_timeout) => {
+            warn!("Search for query '{}' timed out after 30s", query);
+            let safe_q = query.chars().take(40).collect::<String>();
+            let retry_data = format!("retry_search_{}", safe_q);
+            let keyboard = InlineKeyboardMarkup::new(vec![vec![
+                InlineKeyboardButton::callback("🔄 Retry Search", retry_data),
+            ]]);
+
+            let timeout_text = format!(
+                "⏱️ <b>Search Timed Out (30s)</b>\n\n\
+                The Tor network or Z-Library onion mirror took too long to respond for <code>{}</code>.\n\n\
+                Click below to retry or run <code>/doctor</code> to check connection health.",
+                html_escape(query)
+            );
+
+            bot.edit_message_text(chat_id, searching_msg.id, timeout_text)
                 .parse_mode(ParseMode::Html)
+                .reply_markup(keyboard)
                 .send()
                 .await?;
         }
@@ -406,8 +559,22 @@ async fn handle_search_cmd(bot: &Bot, msg: &Message, state: &AppState, query: &s
     Ok(())
 }
 
+/// Execute book search command
+async fn handle_search_cmd(bot: &Bot, msg: &Message, state: &AppState, query: &str) -> ResponseResult<()> {
+    execute_search(bot, msg.chat.id, state, query).await
+}
+
 /// Handle inline keyboard button callbacks for book downloads (Email / Telegram) & re-sends
 async fn handle_callback(bot: Bot, q: CallbackQuery, state: AppState) -> ResponseResult<()> {
+    tokio::spawn(async move {
+        if let Err(err) = process_callback(bot, q, state).await {
+            error!("Error processing Telegram callback query: {:?}", err);
+        }
+    });
+    Ok(())
+}
+
+async fn process_callback(bot: Bot, q: CallbackQuery, state: AppState) -> ResponseResult<()> {
     let user_id = q.from.id.0 as i64;
 
     // Access control check
@@ -429,96 +596,37 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, state: AppState) -> Respons
         None => return Ok(()),
     };
 
-    // Case 1: Re-send via Email from history
+    // Case 1: Re-send via Email from history (Default Email)
     if data.starts_with("resend_email_") {
         bot.answer_callback_query(&q.id).text("⏳ Processing email re-send...").send().await?;
-
         let db_id: i64 = data.trim_start_matches("resend_email_").parse().unwrap_or(0);
-        let status_msg = bot.send_message(chat_id, format!("🔄 Preparing email re-send for record #{}...", db_id))
-            .parse_mode(ParseMode::Html)
-            .send()
-            .await?;
+        return execute_resend_email(&bot, user_id, chat_id, &state, db_id, None).await;
+    }
 
-        let record = match state.db.get_record_by_id(db_id) {
-            Ok(Some(r)) => r,
-            _ => {
-                bot.edit_message_text(chat_id, status_msg.id, "❌ History record not found in database.")
-                    .parse_mode(ParseMode::Html)
-                    .send()
-                    .await?;
-                return Ok(());
-            }
-        };
-
-        let recipient_email = if !record.user_email.is_empty() {
-            record.user_email.clone()
-        } else {
-            state.config.find_user_email(user_id).unwrap_or_default()
-        };
-
-        let file_path = PathBuf::from(&record.local_path);
-        let book_bytes = if file_path.exists() {
-            match fs::read(&file_path).await {
-                Ok(b) => b,
-                Err(e) => {
-                    bot.edit_message_text(chat_id, status_msg.id, format!("❌ Failed to read file: {}", html_escape(&e.to_string())))
-                        .parse_mode(ParseMode::Html)
-                        .send()
-                        .await?;
-                    return Ok(());
-                }
-            }
-        } else {
-            let client = state.client.lock().await;
-            let info = match client.get_download_info(record.book_id, "nohash").await {
-                Ok(i) => i,
-                Err(e) => {
-                    bot.edit_message_text(chat_id, status_msg.id, format!("❌ Re-download failed: {}", html_escape(&e.to_string())))
-                        .parse_mode(ParseMode::Html)
-                        .send()
-                        .await?;
-                    return Ok(());
-                }
-            };
-            match client.download_book_bytes(&info.url).await {
-                Ok(b) => b,
-                Err(e) => {
-                    bot.edit_message_text(chat_id, status_msg.id, format!("❌ Re-download failed: {}", html_escape(&e.to_string())))
-                        .parse_mode(ParseMode::Html)
-                        .send()
-                        .await?;
-                    return Ok(());
-                }
-            }
-        };
-
-        let ext = record.extension.as_deref().unwrap_or("epub");
-        let file_name = format!("book_{}.{}", record.book_id, ext);
-
-        match state.email.send_book_attachment(&recipient_email, &record.book_title, &file_name, &book_bytes, ext) {
-            Ok(_) => {
-                let _ = state.db.update_sent_via_email(db_id, true);
-                bot.edit_message_text(chat_id, status_msg.id, format!("✅ <b>Re-sent to Email!</b>\n\n📧 Delivered to <code>{}</code>", html_escape(&recipient_email)))
-                    .parse_mode(ParseMode::Html)
-                    .send()
-                    .await?;
-            }
-            Err(e) => {
-                bot.edit_message_text(chat_id, status_msg.id, format!("❌ <b>SMTP Delivery Failed:</b> <code>{}</code>", html_escape(&e.to_string())))
-                    .parse_mode(ParseMode::Html)
-                    .send()
-                    .await?;
-            }
-        }
+    // Case 2: Custom Email prompt for history re-send
+    if data.starts_with("resend_custom_") {
+        bot.answer_callback_query(&q.id).text("✉️ Send to Custom Email").send().await?;
+        let db_id: i64 = data.trim_start_matches("resend_custom_").parse().unwrap_or(0);
+        state.pending_custom_emails.lock().await.insert(user_id, PendingCustomEmail::ResendHistory {
+            record_id: db_id,
+            chat_id,
+        });
+        bot.send_message(
+            chat_id,
+            "✉️ <b>Re-send to Custom Email</b>\n\nPlease type the recipient email address (e.g. <code>friend@kindle.com</code> or <code>myemail@gmail.com</code>):\n\n<i>(Or send /cancel to abort)</i>",
+        )
+        .parse_mode(ParseMode::Html)
+        .send()
+        .await?;
         return Ok(());
     }
 
-    // Case 2: Send document directly to Telegram Client from history
+    // Case 3: Re-send via Telegram document from history
     if data.starts_with("resend_tg_") {
-        bot.answer_callback_query(&q.id).text("⏳ Sending file to Telegram chat...").send().await?;
+        bot.answer_callback_query(&q.id).text("⏳ Reading file for Telegram...").send().await?;
 
         let db_id: i64 = data.trim_start_matches("resend_tg_").parse().unwrap_or(0);
-        let status_msg = bot.send_message(chat_id, format!("📄 Preparing file upload for Telegram chat (record #{})...", db_id))
+        let status_msg = bot.send_message(chat_id, format!("🔄 Preparing Telegram delivery for record #{}...", db_id))
             .parse_mode(ParseMode::Html)
             .send()
             .await?;
@@ -534,11 +642,23 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, state: AppState) -> Respons
             }
         };
 
+        let mut record = record;
         let file_path = PathBuf::from(&record.local_path);
         let ext = record.extension.as_deref().unwrap_or("epub");
-        let file_name = format!("book_{}.{}", record.book_id, ext);
 
         if file_path.exists() {
+            if ext.eq_ignore_ascii_case("epub") {
+                if let Ok(book_bytes) = fs::read(&file_path).await {
+                    if let Some((epub_title, epub_author)) = extract_epub_metadata(&book_bytes) {
+                        record.book_title = epub_title;
+                        if epub_author.is_some() {
+                            record.book_author = epub_author;
+                        }
+                    }
+                }
+            }
+
+            let file_name = format_attachment_filename(&record.book_title, record.book_author.as_deref(), ext);
             let input_file = InputFile::file(&file_path).file_name(file_name);
             let caption = format!("📖 <b>{}</b>\n👤 Author: {}", html_escape(&record.book_title), html_escape(record.book_author.as_deref().unwrap_or("Unknown")));
 
@@ -559,7 +679,95 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, state: AppState) -> Respons
         return Ok(());
     }
 
-    // Case 3: Download book and send (Email or Telegram client)
+    // Case 4: Delete record from history
+    if data.starts_with("delete_hist_") {
+        bot.answer_callback_query(&q.id).text("🗑️ Deleting record...").send().await?;
+
+        let db_id: i64 = data.trim_start_matches("delete_hist_").parse().unwrap_or(0);
+
+        let (book_title, local_path) = match state.db.get_record_by_id(db_id) {
+            Ok(Some(r)) => (r.book_title.clone(), r.local_path.clone()),
+            _ => ("Book".to_string(), String::new()),
+        };
+
+        match state.db.delete_record(db_id, user_id) {
+            Ok(true) => {
+                if !local_path.is_empty() {
+                    let file_path = PathBuf::from(&local_path);
+                    if file_path.exists() {
+                        let _ = fs::remove_file(file_path).await;
+                    }
+                }
+
+                if let Some(ref m) = q.message {
+                    bot.edit_message_text(
+                        m.chat().id,
+                        m.id(),
+                        format!("🗑️ <b>Deleted from History:</b> 📖 <i>{}</i>", html_escape(&book_title)),
+                    )
+                    .parse_mode(ParseMode::Html)
+                    .send()
+                    .await?;
+                }
+            }
+            Ok(false) => {
+                if let Some(ref m) = q.message {
+                    bot.edit_message_text(m.chat().id, m.id(), "❌ Record not found or unauthorized.")
+                        .parse_mode(ParseMode::Html)
+                        .send()
+                        .await?;
+                }
+            }
+            Err(e) => {
+                if let Some(ref m) = q.message {
+                    bot.edit_message_text(m.chat().id, m.id(), format!("❌ Failed to delete record: {}", html_escape(&e.to_string())))
+                        .parse_mode(ParseMode::Html)
+                        .send()
+                        .await?;
+                }
+            }
+        }
+        return Ok(());
+    }
+
+    // Case 5: Retry Search from timeout or error card
+    if data.starts_with("retry_search_") {
+        let query_str = data.trim_start_matches("retry_search_");
+        bot.answer_callback_query(&q.id)
+            .text(format!("🔄 Retrying search for '{}'...", query_str))
+            .send()
+            .await?;
+
+        execute_search(&bot, chat_id, &state, query_str).await?;
+        return Ok(());
+    }
+
+    // Case 6: Custom Email prompt for search download
+    if data.starts_with("dl_custom_") {
+        bot.answer_callback_query(&q.id).text("✉️ Send to Custom Email").send().await?;
+        let payload = data.trim_start_matches("dl_custom_");
+        let parts: Vec<&str> = payload.splitn(2, '_').collect();
+        if parts.len() == 2 {
+            if let Ok(b_id) = parts[0].parse::<u64>() {
+                let b_hash = parts[1].to_string();
+                state.pending_custom_emails.lock().await.insert(user_id, PendingCustomEmail::NewDownload {
+                    book_id: b_id,
+                    book_hash: b_hash,
+                    chat_id,
+                });
+                bot.send_message(
+                    chat_id,
+                    "✉️ <b>Send to Custom Email</b>\n\nPlease type the recipient email address (e.g. <code>friend@kindle.com</code> or <code>myemail@gmail.com</code>):\n\n<i>(Or send /cancel to abort)</i>",
+                )
+                .parse_mode(ParseMode::Html)
+                .send()
+                .await?;
+            }
+        }
+        return Ok(());
+    }
+
+    // Case 7: Download book and send (Default Email or Telegram)
     let is_tg_download = data.starts_with("dl_tg_");
     let is_email_download = data.starts_with("dl_email_") || data.starts_with("dl_");
 
@@ -591,14 +799,143 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, state: AppState) -> Respons
     };
     let book_hash = parts[1];
 
+    execute_download_and_send(&bot, user_id, chat_id, &state, book_id, book_hash, is_tg_download, None).await
+}
+
+async fn execute_resend_email(
+    bot: &Bot,
+    user_id: i64,
+    chat_id: ChatId,
+    state: &AppState,
+    db_id: i64,
+    custom_email: Option<String>,
+) -> ResponseResult<()> {
+    let status_msg = bot.send_message(chat_id, format!("🔄 Preparing email re-send for record #{}...", db_id))
+        .parse_mode(ParseMode::Html)
+        .send()
+        .await?;
+
+    let record = match state.db.get_record_by_id(db_id) {
+        Ok(Some(r)) => r,
+        _ => {
+            bot.edit_message_text(chat_id, status_msg.id, "❌ History record not found in database.")
+                .parse_mode(ParseMode::Html)
+                .send()
+                .await?;
+            return Ok(());
+        }
+    };
+
+    let recipient_email = match custom_email {
+        Some(ref e) if !e.trim().is_empty() => e.trim().to_string(),
+        _ => match state.config.find_user_email(user_id) {
+            Some(email) if !email.is_empty() => email,
+            _ => record.user_email.clone(),
+        },
+    };
+
+    if recipient_email.is_empty() {
+        bot.edit_message_text(chat_id, status_msg.id, "❌ No email address configured. Use <code>/email &lt;address&gt;</code>.")
+            .parse_mode(ParseMode::Html)
+            .send()
+            .await?;
+        return Ok(());
+    }
+
+    let file_path = PathBuf::from(&record.local_path);
+    let book_bytes = if file_path.exists() {
+        match fs::read(&file_path).await {
+            Ok(b) => b,
+            Err(e) => {
+                bot.edit_message_text(chat_id, status_msg.id, format!("❌ Failed to read file: {}", html_escape(&e.to_string())))
+                    .parse_mode(ParseMode::Html)
+                    .send()
+                    .await?;
+                return Ok(());
+            }
+        }
+    } else {
+        let client = state.client.lock().await.clone();
+        let info = match client.get_download_info(record.book_id, "nohash").await {
+            Ok(i) => i,
+            Err(e) => {
+                bot.edit_message_text(chat_id, status_msg.id, format!("❌ Re-download failed: {}", html_escape(&e.to_string())))
+                    .parse_mode(ParseMode::Html)
+                    .send()
+                    .await?;
+                return Ok(());
+            }
+        };
+        match client.download_book_bytes(&info.url).await {
+            Ok(b) => b,
+            Err(e) => {
+                bot.edit_message_text(chat_id, status_msg.id, format!("❌ Re-download failed: {}", html_escape(&e.to_string())))
+                    .parse_mode(ParseMode::Html)
+                    .send()
+                    .await?;
+                return Ok(());
+            }
+        }
+    };
+
+    let mut record = record;
+    let ext = record.extension.as_deref().unwrap_or("epub");
+
+    if ext.eq_ignore_ascii_case("epub") {
+        if let Some((epub_title, epub_author)) = extract_epub_metadata(&book_bytes) {
+            record.book_title = epub_title;
+            if epub_author.is_some() {
+                record.book_author = epub_author;
+            }
+        }
+    }
+
+    let attachment_name = format_attachment_filename(&record.book_title, record.book_author.as_deref(), ext);
+
+    match state.email.send_book_attachment(&recipient_email, &record.book_title, record.book_author.as_deref(), &attachment_name, &book_bytes, ext) {
+        Ok(_) => {
+            let _ = state.db.update_sent_via_email(db_id, true);
+            bot.edit_message_text(
+                chat_id,
+                status_msg.id,
+                format!(
+                    "✅ <b>Sent to Email!</b>\n\n📧 Delivered to <code>{}</code>\n📎 <b>Attachment:</b> <code>{}</code>",
+                    html_escape(&recipient_email),
+                    html_escape(&attachment_name)
+                ),
+            )
+            .parse_mode(ParseMode::Html)
+            .send()
+            .await?;
+        }
+        Err(e) => {
+            bot.edit_message_text(chat_id, status_msg.id, format!("❌ <b>SMTP Delivery Failed:</b> <code>{}</code>", html_escape(&e.to_string())))
+                .parse_mode(ParseMode::Html)
+                .send()
+                .await?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn execute_download_and_send(
+    bot: &Bot,
+    user_id: i64,
+    chat_id: ChatId,
+    state: &AppState,
+    book_id: u64,
+    book_hash: &str,
+    is_tg_download: bool,
+    custom_email: Option<String>,
+) -> ResponseResult<()> {
     let status_msg = bot.send_message(chat_id, format!("📥 Fetching download link for book ID {} over Tor...", book_id))
         .parse_mode(ParseMode::Html)
         .send()
         .await?;
 
-    // 1. Resolve download URL & fetch bytes over Tor
     let (dl_info, book_bytes) = {
-        let client = state.client.lock().await;
+        let client = state.client.lock().await.clone();
         let info = match client.get_download_info(book_id, book_hash).await {
             Ok(i) => i,
             Err(e) => {
@@ -630,8 +967,20 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, state: AppState) -> Respons
         (info, bytes)
     };
 
+    let mut dl_info = dl_info;
     let ext = dl_info.book.extension.as_deref().unwrap_or("epub");
-    let file_name = format!("book_{}.{}", book_id, ext);
+
+    if ext.eq_ignore_ascii_case("epub") {
+        if let Some((epub_title, epub_author)) = extract_epub_metadata(&book_bytes) {
+            info!("Extracted untruncated EPUB metadata: title='{}', author='{:?}'", epub_title, epub_author);
+            dl_info.book.title = epub_title;
+            if epub_author.is_some() {
+                dl_info.book.author = epub_author;
+            }
+        }
+    }
+
+    let file_name = format_attachment_filename(&dl_info.book.title, dl_info.book.author.as_deref(), ext);
 
     // 2. Save locally into ./downloads/<user_id>/<file_name>
     let user_dir = PathBuf::from(&state.config.storage.download_dir).join(user_id.to_string());
@@ -650,7 +999,10 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, state: AppState) -> Respons
     }
 
     // 3. Handle Delivery Target (Telegram document upload OR Email attachment)
-    let recipient_email = state.config.find_user_email(user_id).unwrap_or_default();
+    let recipient_email = match custom_email {
+        Some(ref e) if !e.trim().is_empty() => e.trim().to_string(),
+        _ => state.config.find_user_email(user_id).unwrap_or_default(),
+    };
     let mut email_sent = false;
 
     if is_tg_download {
@@ -670,14 +1022,24 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, state: AppState) -> Respons
         }
     } else {
         // Send via Email
-        if !recipient_email.is_empty() {
-            bot.edit_message_text(chat_id, status_msg.id, format!("📧 Sending book via SMTP to <code>{}</code>...", html_escape(&recipient_email)))
-                .parse_mode(ParseMode::Html)
-                .send()
-                .await
-                .ok();
+        let attachment_name = format_attachment_filename(&dl_info.book.title, dl_info.book.author.as_deref(), ext);
 
-            match state.email.send_book_attachment(&recipient_email, &dl_info.book.title, &file_name, &book_bytes, ext) {
+        if !recipient_email.is_empty() {
+            bot.edit_message_text(
+                chat_id,
+                status_msg.id,
+                format!(
+                    "📧 Sending book via SMTP to <code>{}</code>...\n📎 <b>Attachment:</b> <code>{}</code>",
+                    html_escape(&recipient_email),
+                    html_escape(&attachment_name)
+                ),
+            )
+            .parse_mode(ParseMode::Html)
+            .send()
+            .await
+            .ok();
+
+            match state.email.send_book_attachment(&recipient_email, &dl_info.book.title, dl_info.book.author.as_deref(), &attachment_name, &book_bytes, ext) {
                 Ok(_) => { email_sent = true; }
                 Err(e) => { error!("Failed sending email to {}: {}", recipient_email, e); }
             }
@@ -688,10 +1050,12 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, state: AppState) -> Respons
             📖 <b>Book:</b> {}\n\
             📁 <b>Saved Locally:</b> <code>{}</code>\n\
             📧 <b>Email:</b> {}\n\
+            📎 <b>Attachment:</b> <code>{}</code>\n\
             📦 <b>Size:</b> {} bytes",
             html_escape(&dl_info.book.title),
             html_escape(&local_path_str),
             if email_sent { format!("Sent to <code>{}</code>", html_escape(&recipient_email)) } else { "Failed / Not configured".into() },
+            html_escape(&attachment_name),
             book_bytes.len()
         );
 
