@@ -160,8 +160,10 @@ async fn serve_dashboard_page(State(state): State<DashboardState>) -> Html<Strin
             r#"<span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-purple-500/10 text-purple-400 border border-purple-500/20">💬 Telegram Direct</span>"#.to_string()
         };
 
+        let ext_lower = r.extension.as_deref().unwrap_or("epub").to_lowercase();
+
         table_rows_html.push_str(&format!(
-            r#"<tr class="hover:bg-slate-800/40 transition-colors border-b border-slate-800/60" data-search="{search_key}">
+            r#"<tr class="hover:bg-slate-800/40 transition-colors border-b border-slate-800/60" data-ext="{ext_lower}" data-search="{search_key}">
                 <td class="px-6 py-4 whitespace-nowrap text-sm font-mono text-slate-400">#{id}</td>
                 <td class="px-6 py-4">
                     <div class="flex items-center space-x-3">
@@ -185,6 +187,7 @@ async fn serve_dashboard_page(State(state): State<DashboardState>) -> Html<Strin
                 </td>
             </tr>"#,
             id = r.id,
+            ext_lower = ext_lower,
             ext = ext,
             title = html_escape(&clean_title),
             author = html_escape(author),
@@ -192,7 +195,7 @@ async fn serve_dashboard_page(State(state): State<DashboardState>) -> Html<Strin
             delivery = delivery_badge,
             size = size_kb,
             date = &r.downloaded_at,
-            search_key = html_escape(&format!("{} {} {} {}", clean_title, author, user_display, r.user_email).to_lowercase())
+            search_key = html_escape(&format!("{} {} {} {} {}", clean_title, author, user_display, r.user_email, ext_lower).to_lowercase())
         ));
     }
 
@@ -260,9 +263,27 @@ async fn serve_dashboard_page(State(state): State<DashboardState>) -> Html<Strin
             </div>
         </div>
 
-        <!-- Search Bar -->
-        <div class="relative">
-            <input type="text" id="dashSearch" placeholder="🔍 Search downloads by book title, author, user ID, or recipient email..." 
+        <!-- Search Bar & Book Type Filter Pills -->
+        <div class="space-y-4">
+            <div class="flex flex-wrap items-center gap-2" id="formatFilters">
+                <span class="text-xs font-semibold text-slate-400 uppercase tracking-wider mr-2">Filter Format:</span>
+                <button data-filter="all" class="filter-btn px-4 py-2 text-xs font-semibold rounded-lg bg-cyan-500 text-white shadow-md shadow-cyan-500/20 border border-cyan-400/30 transition-all">
+                    All Formats
+                </button>
+                <button data-filter="epub" class="filter-btn px-4 py-2 text-xs font-semibold rounded-lg bg-slate-900 border border-slate-800 text-slate-300 hover:border-cyan-500/40 hover:text-white transition-all">
+                    📘 EPUB
+                </button>
+                <button data-filter="pdf" class="filter-btn px-4 py-2 text-xs font-semibold rounded-lg bg-slate-900 border border-slate-800 text-slate-300 hover:border-cyan-500/40 hover:text-white transition-all">
+                    📄 PDF
+                </button>
+                <button data-filter="mobi" class="filter-btn px-4 py-2 text-xs font-semibold rounded-lg bg-slate-900 border border-slate-800 text-slate-300 hover:border-cyan-500/40 hover:text-white transition-all">
+                    📖 MOBI
+                </button>
+                <button data-filter="azw3" class="filter-btn px-4 py-2 text-xs font-semibold rounded-lg bg-slate-900 border border-slate-800 text-slate-300 hover:border-cyan-500/40 hover:text-white transition-all">
+                    📗 AZW3
+                </button>
+            </div>
+            <input type="text" id="dashSearch" placeholder="🔍 Search downloads by book title, author, user ID, format, or recipient email..." 
                 class="w-full bg-slate-900/80 border border-slate-800 rounded-xl px-5 py-3.5 text-sm text-slate-100 placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-cyan-500 focus:border-transparent shadow-inner transition-all">
         </div>
 
@@ -289,17 +310,41 @@ async fn serve_dashboard_page(State(state): State<DashboardState>) -> Html<Strin
     </div>
 
     <script>
-        document.getElementById('dashSearch').addEventListener('input', function(e) {{
-            const query = e.target.value.toLowerCase().trim();
+        let activeFilter = 'all';
+        let searchQuery = '';
+
+        function applyFilters() {{
             const rows = document.querySelectorAll('#dashTbody tr');
             rows.forEach(row => {{
-                const searchKey = row.getAttribute('data-search');
-                if (!searchKey || searchKey.includes(query)) {{
+                const ext = row.getAttribute('data-ext') || '';
+                const searchKey = row.getAttribute('data-search') || '';
+                
+                const matchesFilter = (activeFilter === 'all' || ext === activeFilter);
+                const matchesSearch = (!searchQuery || searchKey.includes(searchQuery));
+
+                if (matchesFilter && matchesSearch) {{
                     row.style.display = '';
                 }} else {{
                     row.style.display = 'none';
                 }}
             }});
+        }}
+
+        document.querySelectorAll('.filter-btn').forEach(btn => {{
+            btn.addEventListener('click', function() {{
+                document.querySelectorAll('.filter-btn').forEach(b => {{
+                    b.className = 'filter-btn px-4 py-2 text-xs font-semibold rounded-lg bg-slate-900 border border-slate-800 text-slate-300 hover:border-cyan-500/40 hover:text-white transition-all';
+                }});
+                this.className = 'filter-btn px-4 py-2 text-xs font-semibold rounded-lg bg-cyan-500 text-white shadow-md shadow-cyan-500/20 border border-cyan-400/30 transition-all';
+
+                activeFilter = this.getAttribute('data-filter');
+                applyFilters();
+            }});
+        }});
+
+        document.getElementById('dashSearch').addEventListener('input', function(e) {{
+            searchQuery = e.target.value.toLowerCase().trim();
+            applyFilters();
         }});
     </script>
 </body>

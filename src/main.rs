@@ -81,6 +81,7 @@ async fn main() -> Result<()> {
         db,
         email,
         pending_custom_emails: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        search_cache: Arc::new(Mutex::new(std::collections::HashMap::new())),
     };
 
     // 6. Spawn Background Z-Library Auto-Login Task (Concurrently with Telegram Bot Startup)

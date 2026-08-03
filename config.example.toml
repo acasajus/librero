@@ -17,7 +17,7 @@ bot_token = "123456789:ABCdefGhIJKlmNoPQRsTUVwxyZ"
 [[telegram.allowed_users]]
 user_id = 123456789             # Your Telegram numerical User ID
 username = "myuser"             # Optional reference username
-email = "mykindle@kindle.com"   # Email address where books will be sent via SMTP
+kindle_email = "mykindle@kindle.com"   # Kindle email address where books will be sent via SMTP
 
 [smtp]
 # SMTP Server Configuration (Brevo, Gmail App Password, or custom SMTP provider)
@@ -47,17 +47,18 @@ fallback_onion_addresses = [
 connect_timeout_seconds = 45
 
 [calibre]
-# Calibre Content Server & OPDS e-Reader Catalog HTTP Service Settings
+# Calibre Content Server & OPDS e-Reader Catalog HTTP Service Settings (Port 8080)
 enabled = true
 host = "0.0.0.0"
 port = 8080
 server_name = "Librero Calibre Content Server"
 
 [dashboard]
-# Admin Web Dashboard displaying download history, user attribution, and local file downloads
+# Tailwind CSS Admin Web Dashboard displaying download history, user attribution, and local file downloads (Port 8081)
 enabled = true
 host = "0.0.0.0"
 port = 8081
 server_name = "Librero Download History & Admin Dashboard"
+
 
 

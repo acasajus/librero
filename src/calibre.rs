@@ -85,8 +85,10 @@ async fn serve_web_catalog(State(state): State<CalibreServerState>) -> Html<Stri
         let ext = r.extension.as_deref().unwrap_or("epub").to_uppercase();
         let size_mb = format!("{:.2} MB", (r.filesize.unwrap_or(0) as f64) / (1024.0 * 1024.0));
 
+        let ext_lower = r.extension.as_deref().unwrap_or("epub").to_lowercase();
+
         book_cards_html.push_str(&format!(
-            r#"<div class="book-card" data-title="{title_lower}" data-author="{author_lower}">
+            r#"<div class="book-card" data-ext="{ext_lower}" data-title="{title_lower}" data-author="{author_lower}">
                 <div class="book-badge">{ext}</div>
                 <div class="book-details">
                     <h3 class="book-title">{title}</h3>
@@ -96,6 +98,7 @@ async fn serve_web_catalog(State(state): State<CalibreServerState>) -> Html<Stri
                 <a class="download-btn" href="/download/{id}">⏬ Download</a>
             </div>"#,
             id = r.id,
+            ext_lower = ext_lower,
             title = html_escape(&clean_title),
             title_lower = html_escape(&clean_title.to_lowercase()),
             author = html_escape(author),
@@ -174,6 +177,28 @@ async fn serve_web_catalog(State(state): State<CalibreServerState>) -> Html<Stri
             text-decoration: none;
         }}
         .opds-banner a:hover {{ text-decoration: underline; }}
+        .filter-bar {{
+            display: flex;
+            gap: 0.5rem;
+            margin-bottom: 1rem;
+            flex-wrap: wrap;
+        }}
+        .filter-pill {{
+            background: #1e293b;
+            border: 1px solid var(--border);
+            color: var(--text-sub);
+            padding: 0.4rem 0.8rem;
+            border-radius: 8px;
+            font-size: 0.85rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s;
+        }}
+        .filter-pill.active, .filter-pill:hover {{
+            background: var(--accent);
+            color: white;
+            border-color: var(--accent);
+        }}
         .search-box {{
             width: 100%;
             padding: 0.85rem 1.25rem;
@@ -266,7 +291,15 @@ async fn serve_web_catalog(State(state): State<CalibreServerState>) -> Html<Stri
             📱 <b>e-Reader / Mobile App OPDS Feed:</b> <a href="/opds" target="_blank">http://{host_header}/opds</a>
         </div>
 
-        <input type="text" id="searchInput" class="search-box" placeholder="🔍 Search library by title or author...">
+        <div class="filter-bar">
+            <button class="filter-pill active" data-filter="all">All Formats</button>
+            <button class="filter-pill" data-filter="epub">EPUB</button>
+            <button class="filter-pill" data-filter="pdf">PDF</button>
+            <button class="filter-pill" data-filter="mobi">MOBI</button>
+            <button class="filter-pill" data-filter="azw3">AZW3</button>
+        </div>
+
+        <input type="text" id="searchInput" class="search-box" placeholder="🔍 Search library by title, author, or format...">
 
         <div class="book-grid" id="bookGrid">
             {book_cards}
@@ -274,18 +307,39 @@ async fn serve_web_catalog(State(state): State<CalibreServerState>) -> Html<Stri
     </div>
 
     <script>
-        document.getElementById('searchInput').addEventListener('input', function(e) {{
-            const term = e.target.value.toLowerCase().trim();
+        let currentFilter = 'all';
+        let currentSearch = '';
+
+        function applyCalibreFilters() {{
             const cards = document.querySelectorAll('.book-card');
             cards.forEach(card => {{
-                const title = card.getAttribute('data-title');
-                const author = card.getAttribute('data-author');
-                if (title.includes(term) || author.includes(term)) {{
+                const ext = card.getAttribute('data-ext') || '';
+                const title = card.getAttribute('data-title') || '';
+                const author = card.getAttribute('data-author') || '';
+
+                const matchesF = (currentFilter === 'all' || ext === currentFilter);
+                const matchesS = (!currentSearch || title.includes(currentSearch) || author.includes(currentSearch) || ext.includes(currentSearch));
+
+                if (matchesF && matchesS) {{
                     card.style.display = 'flex';
                 }} else {{
                     card.style.display = 'none';
                 }}
             }});
+        }}
+
+        document.querySelectorAll('.filter-pill').forEach(btn => {{
+            btn.addEventListener('click', function() {{
+                document.querySelectorAll('.filter-pill').forEach(b => b.classList.remove('active'));
+                this.classList.add('active');
+                currentFilter = this.getAttribute('data-filter');
+                applyCalibreFilters();
+            }});
+        }});
+
+        document.getElementById('searchInput').addEventListener('input', function(e) {{
+            currentSearch = e.target.value.toLowerCase().trim();
+            applyCalibreFilters();
         }});
     </script>
 </body>

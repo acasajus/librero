@@ -7,14 +7,16 @@ use anyhow::Result;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+use std::collections::HashMap;
 use teloxide::prelude::*;
-use teloxide::types::{BotCommand, ChatId, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, ParseMode};
+use teloxide::types::{
+    BotCommand, BotCommandScope, ChatId, InlineKeyboardButton, InlineKeyboardMarkup, InputFile,
+    ParseMode,
+};
 use tokio::fs;
 use tokio::sync::Mutex;
 use tokio::time::timeout;
 use tracing::{error, info, warn};
-
-use std::collections::HashMap;
 
 #[derive(Clone, Debug)]
 pub enum PendingCustomEmail {
@@ -30,6 +32,7 @@ pub struct AppState {
     pub db: Database,
     pub email: EmailSender,
     pub pending_custom_emails: Arc<Mutex<HashMap<i64, PendingCustomEmail>>>,
+    pub search_cache: Arc<Mutex<HashMap<i64, (String, Vec<Book>)>>>,
 }
 
 /// Start the long-polling Telegram Bot daemon
@@ -39,20 +42,25 @@ pub async fn start_bot(state: AppState) -> Result<()> {
 
     let bot = Bot::new(token);
 
-    // Register Telegram Bot Command Menu in Telegram UI
+    // Register Telegram Bot Command Menu in Telegram UI (Default & AllPrivateChats scope)
     let commands = vec![
-        BotCommand::new("start", "Start the bot and view usage instructions"),
-        BotCommand::new("search", "Search books on Z-Library (e.g. /search rust)"),
-        BotCommand::new("doctor", "Check Tor, Z-Library quota, SMTP & DB health"),
-        BotCommand::new("history", "View your recent download history & re-send books"),
-        BotCommand::new("email", "View or set your default email address"),
+        BotCommand::new("start", "Start bot and view Kindle setup guide"),
+        BotCommand::new("search", "Search books on Z-Library"),
+        BotCommand::new("kindle", "Kindle setup guide and send test file"),
+        BotCommand::new("settings", "Configure 1-tap delivery preference"),
+        BotCommand::new("doctor", "Check Tor, Z-Library quota and system health"),
+        BotCommand::new("history", "View recent download history"),
+        BotCommand::new("email", "View or set default Kindle email address"),
         BotCommand::new("help", "Display help and command menu"),
     ];
 
-    if let Err(e) = bot.set_my_commands(commands).send().await {
-        warn!("Failed to register Telegram bot command menu: {}", e);
+    if let Err(e) = bot.set_my_commands(commands.clone()).send().await {
+        warn!("Failed to register Telegram bot command menu (default scope): {}", e);
+    }
+    if let Err(e) = bot.set_my_commands(commands.clone()).scope(BotCommandScope::AllPrivateChats).send().await {
+        warn!("Failed to register Telegram bot command menu (private scope): {}", e);
     } else {
-        info!("Registered command menu with Telegram: /start, /search, /doctor, /history, /email, /help");
+        info!("Successfully registered command menu with Telegram: /start, /search, /kindle, /settings, /doctor, /history, /email, /help");
     }
 
     let handler = dptree::entry()
@@ -155,15 +163,73 @@ async fn process_message(bot: Bot, msg: Message, state: AppState) -> ResponseRes
         "/start" | "/help" => {
             let welcome_text = format!(
                 "📚 <b>Welcome to Librero Bot!</b>\n\n\
-                Available Commands:\n\
-                • <code>/search &lt;query&gt;</code> - Search for books on Z-Library\n\
+                <b>Available Commands:</b>\n\
+                • <code>/search &lt;query&gt;</code> - Search books on Z-Library\n\
+                • <code>/kindle</code> - Kindle Setup Guide & Send Test File\n\
+                • <code>/settings</code> - Configure 1-Tap Delivery Preference\n\
                 • <code>/doctor</code> - Run system health diagnostics\n\
                 • <code>/history</code> - View download history & re-send books\n\
+                • <code>/email</code> - View or set your default Kindle email\n\
                 • <code>/help</code> - Show this menu\n\n\
-                <i>You can also send any book title/author directly to search!</i>"
+                <i>Send any book title or author directly to search!</i>"
             );
             bot.send_message(msg.chat.id, welcome_text)
                 .parse_mode(ParseMode::Html)
+                .send()
+                .await?;
+            Ok(())
+        }
+        "/kindle" => {
+            let from_addr = &state.config.smtp.from_email;
+            let text = format!(
+                "📱 <b>Send-to-Kindle Setup Guide</b>\n\n\
+                To receive books directly on your Kindle device, follow these 2 steps:\n\n\
+                1️⃣ Open your Amazon account &gt; <b>Manage Your Content and Devices</b> &gt; <b>Preferences</b> &gt; <b>Personal Document Settings</b>.\n\
+                2️⃣ Scroll to <b>Approved Personal Document E-mail List</b> and add:\n\
+                <code>{}</code>\n\n\
+                Click the button below to send a <b>Test File</b> to verify your Kindle setup!",
+                html_escape(from_addr)
+            );
+
+            let keyboard = InlineKeyboardMarkup::new(vec![vec![
+                InlineKeyboardButton::callback("🧪 Send Test File to Kindle", "send_kindle_test"),
+            ]]);
+
+            bot.send_message(msg.chat.id, text)
+                .parse_mode(ParseMode::Html)
+                .reply_markup(keyboard)
+                .send()
+                .await?;
+            Ok(())
+        }
+        "/settings" => {
+            let (pref, _) = state.db.get_user_setting(user_id).unwrap_or(("ask".into(), None));
+            let pref_str = match pref.as_str() {
+                "kindle" => "📧 Always Send to Kindle (1-Tap)",
+                "telegram" => "💬 Always Upload to Telegram Chat",
+                _ => "❓ Ask Every Time (Default)",
+            };
+
+            let text = format!(
+                "⚙️ <b>1-Tap Delivery Preference</b>\n\n\
+                Current Setting: <b>{}</b>\n\n\
+                Select your default 1-Tap action when clicking book search cards:",
+                pref_str
+            );
+
+            let keyboard = InlineKeyboardMarkup::new(vec![
+                vec![
+                    InlineKeyboardButton::callback("📧 Always Send to Kindle", "set_pref_kindle"),
+                    InlineKeyboardButton::callback("💬 Always Telegram", "set_pref_telegram"),
+                ],
+                vec![
+                    InlineKeyboardButton::callback("❓ Ask Every Time", "set_pref_ask"),
+                ],
+            ]);
+
+            bot.send_message(msg.chat.id, text)
+                .parse_mode(ParseMode::Html)
+                .reply_markup(keyboard)
                 .send()
                 .await?;
             Ok(())
@@ -417,47 +483,84 @@ async fn handle_history_cmd(bot: &Bot, msg: &Message, state: &AppState) -> Respo
     Ok(())
 }
 
-/// Format a rich information card for a single book with Email & Telegram client download buttons
-fn send_book_card(index: usize, book: &Book) -> (String, InlineKeyboardMarkup) {
-    let ext = book.extension.as_deref().unwrap_or("N/A").to_uppercase();
-    let size = book.filesize_string.as_deref().unwrap_or("N/A");
-    let author = book.author.as_deref().unwrap_or("Unknown Author");
-    let year = book.year.as_deref().unwrap_or("N/A");
-    let publisher = book.publisher.as_deref().unwrap_or("N/A");
-    let lang = book.language.as_deref().unwrap_or("N/A");
-    let hash = book.hash.as_deref().unwrap_or("nohash");
+/// Render a single, compact, paged carousel message with 3 books per page & inline action buttons
+fn render_search_results_page(
+    query: &str,
+    books: &[Book],
+    page: usize,
+    per_page: usize,
+) -> (String, InlineKeyboardMarkup) {
+    let total_books = books.len();
+    let total_pages = (total_books + per_page - 1) / per_page;
+    let current_page = page.min(total_pages).max(1);
 
-    let card_text = format!(
-        "{}. 📖 <b>{}</b>\n\n\
-        👤 <b>Author:</b> {}\n\
-        🏢 <b>Publisher:</b> {}\n\
-        📅 <b>Year:</b> {} | 🌐 <b>Lang:</b> {}\n\
-        📁 <b>Format:</b> {} ({})",
-        index,
-        html_escape(&book.title),
-        html_escape(author),
-        html_escape(publisher),
-        html_escape(year),
-        html_escape(lang),
-        ext,
-        size
+    let start_idx = (current_page - 1) * per_page;
+    let end_idx = (start_idx + per_page).min(total_books);
+    let page_books = &books[start_idx..end_idx];
+
+    let mut text = format!(
+        "📚 <b>Search Results for \"{}\"</b> (Page {} of {} • {} Total)\n\n",
+        html_escape(query),
+        current_page,
+        total_pages,
+        total_books
     );
 
-    let email_data = format!("dl_email_{}_{}", book.id, hash);
-    let custom_email_data = format!("dl_custom_{}_{}", book.id, hash);
-    let tg_data = format!("dl_tg_{}_{}", book.id, hash);
+    let mut action_rows = Vec::new();
 
-    let keyboard = InlineKeyboardMarkup::new(vec![
-        vec![
-            InlineKeyboardButton::callback(format!("📧 Email ({})", ext), email_data),
-            InlineKeyboardButton::callback("💬 Telegram", tg_data),
-        ],
-        vec![
-            InlineKeyboardButton::callback("✉️ Send to Custom Email", custom_email_data),
-        ],
-    ]);
+    for (i, book) in page_books.iter().enumerate() {
+        let num = start_idx + i + 1;
+        let ext = book.extension.as_deref().unwrap_or("epub").to_uppercase();
+        let size = book.filesize_string.as_deref().unwrap_or("N/A");
+        let author = book.author.as_deref().unwrap_or("Unknown Author");
+        let hash = book.hash.as_deref().unwrap_or("nohash");
 
-    (card_text, keyboard)
+        text.push_str(&format!(
+            "<b>{}️⃣ {}</b>\n👤 <i>{}</i> • 📁 <code>{}</code> ({})\n\n",
+            num,
+            html_escape(&book.title),
+            html_escape(author),
+            ext,
+            size
+        ));
+
+        let email_data = format!("dl_email_{}_{}", book.id, hash);
+        let tg_data = format!("dl_tg_{}_{}", book.id, hash);
+
+        action_rows.push(vec![
+            InlineKeyboardButton::callback(format!("📧 Send #{:.3} to Kindle", num), email_data),
+            InlineKeyboardButton::callback(format!("💬 Download #{:.3} to Telegram", num), tg_data),
+        ]);
+    }
+
+    // Row for Pagination: [ ⬅️ Prev ] [ 1/3 ] [ Next ➡️ ]
+    let mut nav_row = Vec::new();
+    if current_page > 1 {
+        nav_row.push(InlineKeyboardButton::callback(
+            "⬅️ Prev",
+            format!("spage_{}", current_page - 1),
+        ));
+    } else {
+        nav_row.push(InlineKeyboardButton::callback(" ⛔ ", "noop"));
+    }
+
+    nav_row.push(InlineKeyboardButton::callback(
+        format!("{}/{}", current_page, total_pages),
+        "noop",
+    ));
+
+    if current_page < total_pages {
+        nav_row.push(InlineKeyboardButton::callback(
+            "Next ➡️",
+            format!("spage_{}", current_page + 1),
+        ));
+    } else {
+        nav_row.push(InlineKeyboardButton::callback(" ⛔ ", "noop"));
+    }
+
+    action_rows.push(nav_row);
+
+    (text, InlineKeyboardMarkup::new(action_rows))
 }
 
 fn html_escape(s: &str) -> String {
@@ -490,30 +593,17 @@ async fn execute_search(bot: &Bot, chat_id: ChatId, state: &AppState, query: &st
                 return Ok(());
             }
 
-            bot.delete_message(chat_id, searching_msg.id).send().await.ok();
+            // Save search results in user's search cache for interactive pagination
+            let target_user_id = searching_msg.chat.id.0;
+            state.search_cache.lock().await.insert(target_user_id, (query.to_string(), books.clone()));
 
-            let display_count = books.len().min(10);
-            let top_books = &books[..display_count];
+            let (page_text, keyboard) = render_search_results_page(query, &books, 1, 3);
 
-            let header = if books.len() > 10 {
-                format!("📚 <b>Found more than 10 books for '{}'</b> (showing top 10 with full details):", html_escape(query))
-            } else {
-                format!("📚 <b>Found {} books for '{}':</b>", books.len(), html_escape(query))
-            };
-
-            bot.send_message(chat_id, header)
+            bot.edit_message_text(chat_id, searching_msg.id, page_text)
                 .parse_mode(ParseMode::Html)
+                .reply_markup(keyboard)
                 .send()
                 .await?;
-
-            for (idx, book) in top_books.iter().enumerate() {
-                let (card_text, keyboard) = send_book_card(idx + 1, book);
-                bot.send_message(chat_id, card_text)
-                    .parse_mode(ParseMode::Html)
-                    .reply_markup(keyboard)
-                    .send()
-                    .await?;
-            }
         }
         Ok(Err(err)) => {
             error!("Search error: {}", err);
@@ -595,6 +685,99 @@ async fn process_callback(bot: Bot, q: CallbackQuery, state: AppState) -> Respon
         Some(ref m) => m.chat().id,
         None => return Ok(()),
     };
+
+    // Case 00: Search Pagination Callback (spage_<page_num>)
+    if data.starts_with("spage_") {
+        let target_page: usize = data.trim_start_matches("spage_").parse().unwrap_or(1);
+        let cache = state.search_cache.lock().await;
+        if let Some((ref query, ref books)) = cache.get(&user_id) {
+            let (text, keyboard) = render_search_results_page(query, books, target_page, 3);
+            if let Some(ref m) = q.message {
+                bot.edit_message_text(chat_id, m.id(), text)
+                    .parse_mode(ParseMode::Html)
+                    .reply_markup(keyboard)
+                    .send()
+                    .await?;
+            }
+        }
+        bot.answer_callback_query(&q.id).send().await?;
+        return Ok(());
+    }
+
+    if data == "noop" {
+        bot.answer_callback_query(&q.id).send().await?;
+        return Ok(());
+    }
+
+    // Case 0: Kindle Test File Send
+    if data == "send_kindle_test" {
+        bot.answer_callback_query(&q.id).text("Sending test file...").send().await?;
+        let user_email = match state.config.find_user_email(user_id) {
+            Some(e) if !e.is_empty() => e,
+            _ => {
+                bot.send_message(chat_id, "❌ No Kindle email configured. Use <code>/email &lt;address&gt;</code>.").parse_mode(ParseMode::Html).send().await?;
+                return Ok(());
+            }
+        };
+
+        let status_msg = bot.send_message(chat_id, format!("🧪 <b>Sending Kindle Test File to</b> <code>{}</code>...", html_escape(&user_email)))
+            .parse_mode(ParseMode::Html).send().await?;
+
+        let epub_bytes = crate::email::generate_kindle_test_epub();
+        match state.email.send_book_attachment(
+            &user_email,
+            "Librero Kindle Setup Test",
+            Some("Librero Bot"),
+            "Librero Kindle Setup Test.epub",
+            &epub_bytes,
+            "epub",
+        ) {
+            Ok(_) => {
+                bot.edit_message_text(
+                    chat_id,
+                    status_msg.id,
+                    format!(
+                        "🎉 <b>Kindle Test File Sent Successfully!</b>\n\n\
+                        Check your Kindle device or Kindle app in a few minutes.\n\n\
+                        <i>Note: If the book does not appear, ensure <code>{}</code> is added to your Amazon Approved Personal Document E-mail List!</i>",
+                        html_escape(&state.config.smtp.from_email)
+                    ),
+                )
+                .parse_mode(ParseMode::Html)
+                .send()
+                .await?;
+            }
+            Err(e) => {
+                bot.edit_message_text(
+                    chat_id,
+                    status_msg.id,
+                    format!("❌ <b>Kindle Test Send Failed:</b> {}", html_escape(&e.to_string())),
+                )
+                .parse_mode(ParseMode::Html)
+                .send()
+                .await?;
+            }
+        }
+        return Ok(());
+    }
+
+    // Case 0b: 1-Tap Delivery Preference Setting
+    if data.starts_with("set_pref_") {
+        let pref = match data.as_str() {
+            "set_pref_kindle" => "kindle",
+            "set_pref_telegram" => "telegram",
+            _ => "ask",
+        };
+        let _ = state.db.set_default_delivery(user_id, pref);
+        let status_text = match pref {
+            "kindle" => "✅ Preference updated: Always Send to Kindle (1-Tap Delivery enabled)",
+            "telegram" => "✅ Preference updated: Always Upload to Telegram Chat",
+            _ => "✅ Preference updated: Ask Every Time",
+        };
+        bot.answer_callback_query(&q.id).text(status_text).send().await?;
+        bot.send_message(chat_id, status_text).send().await?;
+        return Ok(());
+    }
 
     // Case 1: Re-send via Email from history (Default Email)
     if data.starts_with("resend_email_") {

@@ -51,6 +51,16 @@ impl Database {
         )
         .context("Failed to create 'downloads' database table schema")?;
 
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS user_settings (
+                telegram_user_id INTEGER PRIMARY KEY,
+                default_delivery TEXT NOT NULL DEFAULT 'ask',
+                custom_email TEXT
+            );",
+            [],
+        )
+        .context("Failed to create 'user_settings' database table schema")?;
+
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -212,6 +222,45 @@ impl Database {
         )?;
         Ok(rows > 0)
     }
+
+    /// Get user settings (default_delivery, custom_email)
+    pub fn get_user_setting(&self, telegram_user_id: i64) -> Result<(String, Option<String>)> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT default_delivery, custom_email FROM user_settings WHERE telegram_user_id = ?1",
+        )?;
+        let mut rows = stmt.query(params![telegram_user_id])?;
+        if let Some(row) = rows.next()? {
+            let delivery: String = row.get(0)?;
+            let email: Option<String> = row.get(1)?;
+            Ok((delivery, email))
+        } else {
+            Ok(("ask".to_string(), None))
+        }
+    }
+
+    /// Set user default delivery preference ('ask', 'kindle', 'telegram')
+    pub fn set_default_delivery(&self, telegram_user_id: i64, delivery: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO user_settings (telegram_user_id, default_delivery) VALUES (?1, ?2)
+             ON CONFLICT(telegram_user_id) DO UPDATE SET default_delivery = excluded.default_delivery",
+            params![telegram_user_id, delivery],
+        )?;
+        Ok(())
+    }
+
+    /// Set user custom email preference
+    pub fn set_user_custom_email(&self, telegram_user_id: i64, email: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO user_settings (telegram_user_id, custom_email) VALUES (?1, ?2)
+             ON CONFLICT(telegram_user_id) DO UPDATE SET custom_email = excluded.custom_email",
+            params![telegram_user_id, email],
+        )?;
+        Ok(())
+    }
+
 }
 
 #[cfg(test)]

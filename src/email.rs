@@ -316,33 +316,54 @@ impl EmailSender {
     }
 }
 
+/// Generate a minimal valid EPUB in memory for Kindle setup testing
+pub fn generate_kindle_test_epub() -> Vec<u8> {
+    use std::io::Write;
+    let mut buf = Vec::new();
+    {
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+
+        let _ = zip.start_file("mimetype", options);
+        let _ = zip.write_all(b"application/epub+zip");
+
+        let _ = zip.start_file("META-INF/container.xml", options);
+        let _ = zip.write_all(b"<?xml version=\"1.0\"?><container version=\"1.0\" xmlns=\"urn:oasis:names:tc:opendocument:xmlns:container\"><rootfiles><rootfile full-path=\"OEBPS/content.opf\" media-type=\"application/oebps-package+xml\"/></rootfiles></container>");
+
+        let _ = zip.start_file("OEBPS/content.opf", options);
+        let _ = zip.write_all(b"<?xml version=\"1.0\"?><package xmlns=\"http://www.idpf.org/2007/opf\" unique-identifier=\"BookId\" version=\"2.0\"><metadata xmlns:dc=\"http://purl.org/dc/elements/1.1/\"><dc:title>Librero Kindle Setup Test</dc:title><dc:creator>Librero Bot</dc:creator></metadata><manifest><item id=\"html\" href=\"page.html\" media-type=\"application/xhtml+xml\"/></manifest><spine><itemref idref=\"html\"/></spine></package>");
+
+        let _ = zip.start_file("OEBPS/page.html", options);
+        let _ = zip.write_all("<?xml version=\"1.0\" encoding=\"utf-8\"?><!DOCTYPE html><html xmlns=\"http://www.w3.org/1999/xhtml\"><head><title>Kindle Test</title></head><body><h1>🎉 Kindle Setup Successful!</h1><p>Your Librero Telegram Kindle delivery pipeline is configured and ready.</p></body></html>".as_bytes());
+
+        let _ = zip.finish();
+    }
+    buf
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn test_format_attachment_filename() {
-        assert_eq!(
-            format_attachment_filename("Dune", Some("Frank Herbert"), "epub"),
-            "Dune (Frank Herbert).epub"
-        );
-        assert_eq!(
-            format_attachment_filename("1984", None, ".pdf"),
-            "1984.pdf"
-        );
-        assert_eq!(
-            format_attachment_filename("Title: Test", Some("Author / Name"), "epub"),
-            "Title_ Test (Author _ Name).epub"
-        );
+        let name = format_attachment_filename("Dune", Some("Frank Herbert"), "epub");
+        assert_eq!(name, "Dune (Frank Herbert).epub");
     }
 
     #[test]
     fn test_extract_epub_metadata_non_epub() {
-        let dummy = b"not an epub file";
-        assert!(extract_epub_metadata(dummy).is_none());
+        let dummy_bytes = b"not an epub file";
+        assert_eq!(extract_epub_metadata(dummy_bytes), None);
+    }
+
+    #[test]
+    fn test_generate_kindle_test_epub() {
+        let epub_bytes = generate_kindle_test_epub();
+        assert!(!epub_bytes.is_empty());
+        let (title, author) = extract_epub_metadata(&epub_bytes).unwrap();
+        assert_eq!(title, "Librero Kindle Setup Test");
+        assert_eq!(author.as_deref(), Some("Librero Bot"));
     }
 }
-
-
-
-

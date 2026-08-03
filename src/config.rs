@@ -9,7 +9,8 @@ use tracing::info;
 pub struct TelegramUserConfig {
     pub user_id: i64,
     pub username: Option<String>,
-    pub email: String,
+    #[serde(alias = "email")]
+    pub kindle_email: String,
 }
 
 /// Telegram Bot settings in config.toml
@@ -26,7 +27,7 @@ impl Default for TelegramSettings {
             allowed_users: vec![TelegramUserConfig {
                 user_id: 123456789,
                 username: Some("myusername".to_string()),
-                email: "myemail@kindle.com".to_string(),
+                kindle_email: "myemail@kindle.com".to_string(),
             }],
         }
     }
@@ -193,7 +194,7 @@ impl Config {
             .allowed_users
             .iter()
             .find(|u| u.user_id == telegram_user_id)
-            .map(|u| u.email.clone())
+            .map(|u| u.kindle_email.clone())
     }
 
     /// Check if a Telegram user ID is authorized
